@@ -169,6 +169,13 @@ fi
 # ============================================
 # Start PulseAudio (for audio support)
 # ============================================
+# /tmp lives in the container writable layer and therefore survives `docker start`.
+# A previous run leaves its runtime directory behind with a dead pid file and a
+# socket nobody listens on, so the next PulseAudio cannot start and the
+# readiness probe below times out. Drop the stale directory first, the same way
+# the stale X lock is cleared above.
+rm -rf /tmp/pulse-*
+
 if command -v pulseaudio >/dev/null 2>&1; then
   su -s /bin/bash -c "HOME=$WECHAT_HOME pulseaudio --start --exit-idle-time=-1" wechat || true
   if ! su -s /bin/bash -c "HOME=$WECHAT_HOME /opt/tools/voice-audio-ready" wechat; then
