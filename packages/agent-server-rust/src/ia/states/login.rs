@@ -59,7 +59,8 @@ impl IAState for LoginAccountState {
 
     fn identify(&self, args: &IdentifyArgs) -> Result<IdentifyResult, String> {
         let log_in_btn = query_selector(args.a11y, r#"push-button[name="Log In"]"#)
-            .or_else(|| query_selector(args.a11y, r#"push-button[name="Open WeChat"]"#));
+            .or_else(|| query_selector(args.a11y, r#"push-button[name="Open WeChat"]"#))
+            .or_else(|| query_selector(args.a11y, r#"push-button[name="Enter Weixin"]"#));
         if log_in_btn.is_none() {
             return Ok(IdentifyResult { identified: false, frame: None });
         }

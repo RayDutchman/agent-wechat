@@ -1,8 +1,9 @@
 import { Command, Option } from "commander";
-import { WeChatClient, type WeChatClientOptions } from "@agent-wechat/shared";
+import { SendMessageV2Error, WeChatClient, messageTypeDictionary, type ContactKind, type WeChatClientOptions, type MessageV2, type ListMessagesV2Options, type SendMessageV2Result } from "@agent-wechat/shared";
 import { createSubscriptionClient, type SubscriptionClientOptions } from "./lib/client.js";
-import { spawn, execSync } from "child_process";
-import { randomBytes } from "crypto";
+import { readAllPages } from "./lib/read-pages.js";
+import { spawn, execSync, execFileSync } from "child_process";
+import { randomBytes, createHash } from "crypto";
 import fs from "fs";
 import qrTerminal from "qrcode-terminal";
 import os from "os";
@@ -22,6 +23,27 @@ const MONOREPO_ROOT = path.resolve(__dirname, "../../..");
 // Auth token paths
 const TOKEN_DIR = path.join(os.homedir(), ".config", "agent-wechat");
 const TOKEN_PATH = path.join(TOKEN_DIR, "token");
+const CONTAINER_CONFIG_PATH = path.join(TOKEN_DIR, "container.json");
+
+interface ContainerConfig { project: string; files: string[]; env_file: string }
+
+function readContainerConfig(): ContainerConfig | undefined {
+  if (!fs.existsSync(CONTAINER_CONFIG_PATH)) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(CONTAINER_CONFIG_PATH, "utf8")); }
+  catch (error) { throw new Error(`Invalid container config ${CONTAINER_CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("container.json must be a JSON object");
+  const config = parsed as Record<string, unknown>;
+  if (Object.keys(config).some((key) => !["project", "files", "env_file"].includes(key))) throw new Error("container.json accepts only project, files, and env_file");
+  if (typeof config.project !== "string" || !config.project.trim()) throw new Error("container.json project must be a non-empty string");
+  if (!Array.isArray(config.files) || config.files.length === 0 || config.files.some((file) => typeof file !== "string" || !path.isAbsolute(file) || !fs.existsSync(file) || !fs.statSync(file).isFile())) throw new Error("container.json files must be a non-empty array of existing absolute file paths");
+  if (typeof config.env_file !== "string" || !path.isAbsolute(config.env_file) || !fs.existsSync(config.env_file) || !fs.statSync(config.env_file).isFile()) throw new Error("container.json env_file must be an existing absolute file path");
+  return { project: config.project, files: config.files as string[], env_file: config.env_file };
+}
+
+function composeArgs(config: ContainerConfig): string[] {
+  return ["compose", "--project-name", config.project, "--env-file", config.env_file, ...config.files.flatMap((file) => ["-f", file])];
+}
 
 function ensureToken(): string {
   try {
@@ -114,7 +136,7 @@ program
 
 program
   .command("down")
-  .description("Stop and remove the container")
+  .description("Stop the container")
   .action(cmdDown);
 
 program
@@ -172,8 +194,18 @@ sessionCmd
 program
   .command("status")
   .description("Show container and login status")
-  .action(async () => {
-    await cmdStatus(getClient());
+  .option("-j, --json", "Output the V2 account observation as JSON")
+  .action(async (opts: { json?: boolean }) => {
+    await cmdStatus(getClient(), opts.json ?? false);
+  });
+
+const eventsCmd = program.command("events").description("Change notification commands");
+eventsCmd
+  .command("watch")
+  .description("Watch for broad data-change hints")
+  .option("-j, --json", "Write API event objects as JSON Lines")
+  .action(async (opts: { json?: boolean }) => {
+    await cmdEventsWatch(opts.json ?? false);
   });
 
 // ============================================
@@ -210,11 +242,13 @@ authCmd
 authCmd
   .command("status")
   .description("Check login status")
-  .action(async () => {
+  .option("-j, --json", "Output the V2 account observation as JSON")
+  .action(async (opts: { json?: boolean }) => {
     const client = getClient();
-    const auth = await client.authStatus();
+    const auth = await client.getAccount();
+    if (opts.json) { console.log(JSON.stringify(auth)); return; }
     if (auth.status === "logged_in") {
-      console.log(`Logged in${auth.loggedInUser ? ` as ${auth.loggedInUser}` : ""}`);
+      console.log(`Logged in${auth.account_username ? ` as ${auth.account_username}` : ""}`);
     } else {
       console.log(`Status: ${auth.status.replace(/_/g, " ")}`);
     }
@@ -248,11 +282,14 @@ const chatsCmd = program
 chatsCmd
   .command("list")
   .description("List chats from WeChat database")
-  .option("-l, --limit <number>", "Maximum number of chats", "50")
-  .option("-o, --offset <number>", "Skip first N chats", "0")
+  .option("-l, --limit <number>", "Maximum number of chats", "100")
+  .option("--cursor <cursor>", "Continue a V2 read")
+  .option("--query <text>", "Filter by chat username or name")
+  .option("--expected-account-username <username>", "Require this account on the first page")
+  .option("--all", "Read all pages and release the frozen sample")
   .option("-j, --json", "Output as JSON")
   .action(async (opts) => {
-    await cmdChats(getClient(), parseInt(opts.limit, 10), parseInt(opts.offset, 10), opts.json ?? false);
+    await cmdChatsV2(getClient(), { limit: opts.cursor ? undefined : parseInt(opts.limit, 10), cursor: opts.cursor, q: opts.query, expected_account_username: opts.expectedAccountUsername, all: opts.all ?? false, json: opts.json ?? false });
   });
 
 chatsCmd
@@ -260,14 +297,31 @@ chatsCmd
   .description("Get details for a specific chat")
   .option("-j, --json", "Output as JSON")
   .action(async (chatId: string, opts) => {
-    await cmdChatGet(getClient(), chatId, opts.json ?? false);
+    await cmdChatGetV2(getClient(), chatId, opts.json ?? false);
   });
 
 chatsCmd
   .command("find <name>")
   .description("Find chat by name")
-  .action(async (name: string) => {
-    await cmdFind(getClient(), name);
+  .option("-l, --limit <number>", "Maximum number of results", "100")
+  .option("--cursor <cursor>", "Continue a V2 read")
+  .option("--expected-account-username <username>", "Require this account on the first page")
+  .option("--all", "Read all pages and release the frozen sample")
+  .option("-j, --json", "Output as JSON")
+  .action(async (name: string, opts) => {
+    await cmdChatsV2(getClient(), { limit: opts.cursor ? undefined : parseInt(opts.limit, 10), cursor: opts.cursor, q: name, expected_account_username: opts.expectedAccountUsername, all: opts.all ?? false, json: opts.json ?? false });
+  });
+
+chatsCmd
+  .command("members <roomUsername>")
+  .description("List members and their names in this room")
+  .option("-l, --limit <number>", "Maximum number of members", "100")
+  .option("--cursor <cursor>", "Continue a V2 read")
+  .option("--expected-account-username <username>", "Require this account on the first page")
+  .option("--all", "Read all pages and release the frozen sample")
+  .option("-j, --json", "Output as JSON")
+  .action(async (roomUsername: string, opts) => {
+    await cmdGroupMembersV2(getClient(), roomUsername, { limit: opts.cursor ? undefined : parseInt(opts.limit, 10), cursor: opts.cursor, expected_account_username: opts.expectedAccountUsername, all: opts.all ?? false, json: opts.json ?? false });
   });
 
 chatsCmd
@@ -289,19 +343,28 @@ const contactsCmd = program
 contactsCmd
   .command("list")
   .description("List all contacts from WeChat address book")
-  .option("-l, --limit <number>", "Maximum number of contacts", "200")
-  .option("-o, --offset <number>", "Skip first N contacts", "0")
+  .option("-l, --limit <number>", "Maximum number of contacts", "100")
+  .option("--cursor <cursor>", "Continue a V2 read")
+  .option("--kind <kind>", "Filter by source classification")
+  .option("--query <text>", "Filter by username, alias, remark or nickname")
+  .option("--expected-account-username <username>", "Require this account on the first page")
+  .option("--all", "Read all pages and release the frozen sample")
   .option("-j, --json", "Output as JSON")
   .action(async (opts) => {
-    await cmdContacts(getClient(), parseInt(opts.limit, 10), parseInt(opts.offset, 10), opts.json ?? false);
+    await cmdContactsV2(getClient(), { limit: opts.cursor ? undefined : parseInt(opts.limit, 10), cursor: opts.cursor, kind: opts.kind as ContactKind | undefined, q: opts.query, expected_account_username: opts.expectedAccountUsername, all: opts.all ?? false, json: opts.json ?? false });
   });
 
 contactsCmd
   .command("find <name>")
   .description("Search contacts by name")
+  .option("-l, --limit <number>", "Maximum number of results", "100")
+  .option("--cursor <cursor>", "Continue a V2 read")
+  .option("--expected-account-username <username>", "Require this account on the first page")
+  .option("--kind <kind>", "Filter by source classification")
+  .option("--all", "Read all pages and release the frozen sample")
   .option("-j, --json", "Output as JSON")
   .action(async (name: string, opts) => {
-    await cmdContactsFind(getClient(), name, opts.json ?? false);
+    await cmdContactsV2(getClient(), { limit: opts.cursor ? undefined : parseInt(opts.limit, 10), cursor: opts.cursor, kind: opts.kind as ContactKind | undefined, q: name, expected_account_username: opts.expectedAccountUsername, all: opts.all ?? false, json: opts.json ?? false });
   });
 
 // ============================================
@@ -315,27 +378,43 @@ const messagesCmd = program
 messagesCmd
   .command("list <chatId>")
   .description("List messages for a chat")
-  .option("-l, --limit <number>", "Maximum number of messages", "50")
-  .option("-o, --offset <number>", "Skip first N messages", "0")
+  .option("-l, --limit <number>", "Page size", "30")
+  .option("--cursor <cursor>", "Continue a frozen message page")
+  .option("--order <order>", "Fetch order: asc or desc; readable pages display oldest first", "desc")
+  .option("--config <path>", "JSON file with include/exclude message type filters")
+  .option("--expected-account-username <username>", "Assert the intended account on the first page")
+  .option("--all", "Read all pages serially and release the frozen sample")
   .option("-j, --json", "Output as JSON")
-  .action(async (chatId: string, opts) => {
-    await cmdMessages(getClient(), chatId, parseInt(opts.limit, 10), parseInt(opts.offset, 10), opts.json ?? false);
+  .action(async (chatId: string, opts: { limit: string; cursor?: string; order: string; config?: string; expectedAccountUsername?: string; all?: boolean; json?: boolean }) => {
+    if (opts.order !== "asc" && opts.order !== "desc") throw new Error("--order must be asc or desc");
+    const filters = opts.config ? readMessageTypeFilterConfig(opts.config) : {};
+    await cmdMessagesV2(getClient(), chatId, {
+      ...filters, limit: parseInt(opts.limit, 10), cursor: opts.cursor, order: opts.order as "asc" | "desc",
+      expected_account_username: opts.expectedAccountUsername,
+    }, opts.all ?? false, opts.json ?? false);
   });
 
 messagesCmd
-  .command("media <chatId> <localId>")
+  .command("media <chatId> [localId]")
   .description("Save a media attachment (best available image, file, or voice)")
+  .option("--server-id <id>", "Locate media by the native server message ID")
   .option("--full", "Require the original-resolution image")
   .option("--thumbnail", "Retrieve an image thumbnail instead of full resolution")
   .option("--best", "Retrieve the best available image (default)")
   .option("-o, --output <path>", "Output file path")
-  .action(async (chatId: string, localIdStr: string, opts) => {
+  .action(async (chatId: string, localIdStr: string | undefined, opts: { serverId?: string; full?: boolean; thumbnail?: boolean; best?: boolean; output?: string }) => {
+    if (opts.serverId !== undefined && localIdStr !== undefined) {
+      throw new Error("Use either <localId> or --server-id, not both.");
+    }
+    if (opts.serverId === undefined && localIdStr === undefined) {
+      throw new Error("Provide <localId> or --server-id <id>.");
+    }
     if (Number(!!opts.full) + Number(!!opts.thumbnail) + Number(!!opts.best) > 1) {
       console.error("Choose only one of --full, --thumbnail, or --best.");
       process.exit(1);
     }
     const quality = opts.full ? "full" : opts.thumbnail ? "thumbnail" : "best";
-    await cmdMedia(getClient(), chatId, parseInt(localIdStr, 10), opts.output, quality);
+    await cmdMedia(getClient(), chatId, localIdStr, opts.output, quality, opts.serverId);
   });
 
 messagesCmd
@@ -346,7 +425,9 @@ messagesCmd
   .option("--file <path>", "File to send")
   .option("--voice <path>", "Record audio as one or more voice notes")
   .option("--detach", "Return after the voice job is queued")
-  .action(async (chatId: string, opts: { text?: string; image?: string; file?: string; voice?: string; detach?: boolean }) => {
+  .option("--expected-account-username <username>", "Bind this send to the intended account")
+  .option("-j, --json", "Output the V2 send result as JSON")
+  .action(async (chatId: string, opts: { text?: string; image?: string; file?: string; voice?: string; detach?: boolean; expectedAccountUsername?: string; json?: boolean }) => {
     if (!opts.text && !opts.image && !opts.file && !opts.voice) {
       console.error("Must provide --text, --image, --file, or --voice");
       process.exit(1);
@@ -374,17 +455,17 @@ messagesCmd
       image = { data: data.toString("base64"), mimeType };
     }
 
-    let file: { data: string; filename: string } | undefined;
+    let file: { data: string; filename: string; sha256: string; size: number } | undefined;
     if (opts.file) {
       if (!fs.existsSync(opts.file)) {
         console.error(`File not found: ${opts.file}`);
         process.exit(1);
       }
       const data = fs.readFileSync(opts.file);
-      file = { data: data.toString("base64"), filename: path.basename(opts.file) };
+      file = { data: data.toString("base64"), filename: path.basename(opts.file), sha256: createHash("sha256").update(data).digest("hex"), size: data.byteLength };
     }
 
-    await cmdSend(getClient(), chatId, opts.text, image, file);
+    await cmdSend(getClient(), chatId, opts.text, image, file, opts.expectedAccountUsername, opts.json ?? false);
   });
 
 const voiceCmd = messagesCmd.command("voice").description("Inspect or cancel voice jobs");
@@ -454,7 +535,11 @@ program
 // Command Implementations
 // ============================================
 
-async function cmdStatus(client: WeChatClient) {
+async function cmdStatus(client: WeChatClient, jsonOutput = false) {
+  if (jsonOutput) {
+    console.log(JSON.stringify(await client.getAccount()));
+    return;
+  }
   const container = getContainerRuntimeState();
   if (container === "up") {
     console.log("Container: up");
@@ -467,9 +552,8 @@ async function cmdStatus(client: WeChatClient) {
   }
 
   try {
-    const status = await client.status();
+    const account = await client.getAccount();
     console.log("Server: reachable");
-    console.log("Version:", status.version);
   } catch (err) {
     console.log("Server: unreachable");
     console.log(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -477,9 +561,9 @@ async function cmdStatus(client: WeChatClient) {
   }
 
   try {
-    const auth = await client.authStatus();
+    const auth = await client.getAccount();
     if (auth.status === "logged_in") {
-      console.log(`Login: logged in${auth.loggedInUser ? ` as ${auth.loggedInUser}` : ""}`);
+      console.log(`Login: logged in${auth.account_username ? ` as ${auth.account_username}` : ""}`);
     } else {
       console.log(`Login: ${auth.status.replace(/_/g, " ")}`);
     }
@@ -488,7 +572,37 @@ async function cmdStatus(client: WeChatClient) {
   }
 }
 
+async function cmdEventsWatch(json: boolean): Promise<void> {
+  const controller = new AbortController();
+  const onInterrupt = () => controller.abort();
+  process.once("SIGINT", onInterrupt);
+  try {
+    for await (const event of getClient().subscribeChanges({
+      signal: controller.signal,
+      onStatus: (status) => console.error(`Events: ${status}`),
+    })) {
+      if (json) console.log(JSON.stringify(event));
+      else console.log("Data may have changed; read again if needed.");
+    }
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+    controller.abort();
+  }
+}
+
 function getContainerRuntimeState(): "up" | "down" | "unknown" {
+  const containerConfig = readContainerConfig();
+  if (containerConfig) {
+    try {
+      const running = execFileSync("docker", [...composeArgs(containerConfig), "ps", "--status", "running", "--quiet", "agent-wechat"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      return running ? "up" : "down";
+    } catch {
+      return "unknown";
+    }
+  }
   try {
     const existing = execSync(`docker ps -aq -f "name=^${CONTAINER_NAME}$"`, {
       encoding: "utf-8",
@@ -586,159 +700,229 @@ async function cmdLogin(
   }
 }
 
-async function cmdChats(client: WeChatClient, limit: number = 50, offset: number = 0, json: boolean = false) {
-  const chats = await client.listChats(limit, offset);
+type V2ReadPage<T> = { items: T[]; next_cursor: string | null; release_token: string | null };
+type V2CliOptions = { limit?: number; cursor?: string; all: boolean; json: boolean; q?: string; kind?: ContactKind; expected_account_username?: string };
 
-  if (json) {
-    console.log(JSON.stringify(chats, null, 2));
+async function outputV2Pages<T>(
+  client: WeChatClient,
+  options: V2CliOptions,
+  fetchPage: (pageOptions: { limit?: number; cursor?: string; q?: string; kind?: ContactKind; expected_account_username?: string }) => Promise<V2ReadPage<T>>,
+  render: (items: T[]) => void,
+) {
+  const pageOptions = (cursor?: string, first = false) => ({
+    ...(options.q !== undefined ? { q: options.q } : {}),
+    ...(options.kind !== undefined ? { kind: options.kind } : {}),
+    ...(first && cursor === undefined && options.expected_account_username !== undefined ? { expected_account_username: options.expected_account_username } : {}),
+    ...(cursor !== undefined ? { cursor } : {}),
+    ...(first && cursor === undefined && options.limit !== undefined ? { limit: options.limit } : {}),
+  });
+  if (options.all) {
+    let first = true;
+    let interrupted = false;
+    const onInterrupt = () => { interrupted = true; };
+    process.on("SIGINT", onInterrupt);
+    try {
+      await readAllPages(
+        (cursor) => {
+          const current = first ? options.cursor : cursor;
+          first = false;
+          return fetchPage(pageOptions(current, current === undefined));
+        },
+        (token) => client.releaseReadSnapshotV2(token),
+        (page) => {
+          if (options.json) console.log(JSON.stringify(page));
+          else render(page.items);
+        },
+        () => interrupted,
+      );
+    } finally {
+      process.removeListener("SIGINT", onInterrupt);
+    }
+    if (interrupted) throw new Error("V2 read interrupted");
     return;
   }
-
-  if (chats.length === 0) {
-    console.log("No chats found. Make sure you're logged in.");
-    return;
-  }
-
-  console.log(`Found ${chats.length} chat(s):\n`);
-
-  // Chat ID column width based on actual data
-  const maxIdLen = Math.max(10, ...chats.map(c => c.username?.length ?? c.id.length));
-  const idHeader = "Chat ID".padEnd(maxIdLen);
-  console.log(`${idHeader}  Unread  Group  Name`);
-  console.log("-".repeat(maxIdLen + 30));
-  for (const chat of chats) {
-    const id = (chat.username ?? chat.id).padEnd(maxIdLen);
-    const unread = chat.unreadCount > 0 ? String(chat.unreadCount).padStart(2) : "  ";
-    const group = chat.isGroup ? "  Y  " : "     ";
-    console.log(`${id}  ${unread}    ${group}  ${chat.name}`);
-  }
+  const page = await fetchPage(pageOptions(options.cursor, options.cursor === undefined));
+  if (options.json) console.log(JSON.stringify(page, null, 2));
+  else render(page.items);
 }
 
-async function cmdChatGet(client: WeChatClient, chatId: string, json: boolean = false) {
-  const chat = await client.getChat(chatId);
+async function cmdChatsV2(client: WeChatClient, options: V2CliOptions) {
+  await outputV2Pages(client, options, (pageOptions) => client.listChatsV2({ q: pageOptions.q, limit: pageOptions.limit, cursor: pageOptions.cursor, expected_account_username: pageOptions.expected_account_username }), (chats) => {
+    if (chats.length === 0) { console.log("No chats found."); return; }
+    console.log(`Found ${chats.length} chat(s):\n`);
+    const width = Math.max(10, ...chats.map((chat) => chat.username.length));
+    console.log(`${"Username".padEnd(width)}  Unread  Group  Name`);
+    console.log("-".repeat(width + 30));
+    for (const chat of chats) {
+      console.log(`${chat.username.padEnd(width)}  ${chat.unread_count === null ? "—" : chat.unread_count > 0 ? String(chat.unread_count).padStart(2) : "  "}    ${chat.is_group ? "Y" : " "}      ${chat.display_name}`);
+    }
+  });
+}
 
-  if (!chat) {
-    console.error(`Chat not found: ${chatId}`);
-    process.exit(1);
-  }
-
-  if (json) {
-    console.log(JSON.stringify(chat, null, 2));
-    return;
-  }
-
-  console.log(`Chat ID:        ${chat.username ?? chat.id}`);
-  console.log(`Name:           ${chat.name}`);
+async function cmdChatGetV2(client: WeChatClient, username: string, json: boolean) {
+  const chat = await client.getChatV2(username);
+  if (json) { console.log(JSON.stringify(chat, null, 2)); return; }
+  console.log(`Username:       ${chat.username}`);
+  console.log(`Name:           ${chat.display_name}`);
   if (chat.remark) console.log(`Remark:         ${chat.remark}`);
-  console.log(`Group:          ${chat.isGroup ? "Yes" : "No"}`);
-  console.log(`Unread:         ${chat.unreadCount}`);
-  if (chat.lastMessagePreview) {
-    const sender = chat.lastMessageSender ? `${chat.lastMessageSender}: ` : "";
-    console.log(`Last message:   ${sender}${chat.lastMessagePreview}`);
-  }
-  if (chat.lastActivityAt) console.log(`Last activity:  ${chat.lastActivityAt}`);
+  console.log(`Group:          ${chat.is_group ? "Yes" : "No"}`);
+  console.log(`Unread:         ${chat.unread_count ?? "—"}`);
+  if (chat.last_message_preview !== null) console.log(`Last message:   ${chat.last_sender_display_name ? `${chat.last_sender_display_name}: ` : ""}${chat.last_message_preview}`);
+  if (chat.last_activity_at !== null) console.log(`Last activity:  ${chat.last_activity_at}`);
 }
 
-/** WeChat base message types */
-const MSG_BASE_TYPES: Record<number, string> = {
-  1: "text",
-  3: "image",
-  34: "voice",
-  43: "video",
-  47: "emoji",
-  49: "appmsg",
-  10000: "system",
-  10002: "revoke",
-};
-
-/** Appmsg (type 49) subtypes */
-const APPMSG_SUB_TYPES: Record<number, string> = {
-  1: "text-link",
-  3: "music",
-  4: "video",
-  5: "link",
-  6: "file",
-  8: "sticker",
-  19: "location",
-  33: "mini-program",
-  36: "mini-program",
-  57: "reply",
-  63: "livestream",
-};
-
-function getMsgTypeLabel(rawType: number): string {
-  const base = rawType & 0xFFFFFFFF;
-  const sub = Math.floor(rawType / 0x100000000);
-
-  const baseLabel = MSG_BASE_TYPES[base];
-  if (!baseLabel) return `type:${rawType}`;
-
-  if (base === 49 && sub > 0) {
-    return APPMSG_SUB_TYPES[sub] ?? `appmsg:${sub}`;
-  }
-  return baseLabel;
+async function cmdContactsV2(client: WeChatClient, options: V2CliOptions) {
+  await outputV2Pages(client, options, (pageOptions) => client.listContactsV2(pageOptions), (contacts) => {
+    if (contacts.length === 0) { console.log("No contacts found."); return; }
+    console.log(`Found ${contacts.length} contact(s):\n`);
+    const width = Math.max(10, ...contacts.map((contact) => contact.username.length));
+    console.log(`${"Username".padEnd(width)}  Kind        Name`);
+    console.log("-".repeat(width + 30));
+    for (const contact of contacts) console.log(`${contact.username.padEnd(width)}  ${contact.kind.padEnd(10)}  ${contact.display_name}`);
+  });
 }
 
-async function cmdMessages(client: WeChatClient, chatId: string, limit: number = 50, offset: number = 0, json: boolean = false) {
-  const messages = await client.listMessages(chatId, limit, offset);
+async function cmdGroupMembersV2(client: WeChatClient, roomUsername: string, options: V2CliOptions) {
+  await outputV2Pages(client, options, (pageOptions) => client.listGroupMembersV2(roomUsername, { limit: pageOptions.limit, cursor: pageOptions.cursor, expected_account_username: pageOptions.expected_account_username }), (members) => {
+    if (members.length === 0) { console.log("No local member records found."); return; }
+    console.log(`Found ${members.length} member(s) in ${roomUsername}:\n`);
+    const width = Math.max(8, ...members.map((member) => member.username.length));
+    console.log(`${"Username".padEnd(width)}  Group nickname  Name`);
+    console.log("-".repeat(width + 30));
+    for (const member of members) console.log(`${member.username.padEnd(width)}  ${member.group_nickname}  ${member.display_name}`);
+  });
+}
 
-  if (json) {
-    console.log(JSON.stringify(messages, null, 2));
+function readMessageTypeFilterConfig(filePath: string): Pick<ListMessagesV2Options, "include" | "exclude"> {
+  const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Message filter config must be a JSON object");
+  const config = parsed as Record<string, unknown>;
+  if (Object.keys(config).some((key) => key !== "include" && key !== "exclude")) throw new Error("Message filter config accepts only include and exclude");
+  const parseList = (key: "include" | "exclude") => {
+    if (!(key in config)) return undefined;
+    const value = config[key];
+    if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
+    return value.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`${key} entries must be objects`);
+      const item = entry as Record<string, unknown>;
+      if (Object.keys(item).some((field) => field !== "type" && field !== "sub_type")) throw new Error(`${key} entries accept only type and sub_type`);
+      const validCode = (code: unknown) => Number.isInteger(code) && Number(code) >= 0 && Number(code) <= 0xFFFF_FFFF;
+      if (!validCode(item.type) || (item.sub_type !== undefined && !validCode(item.sub_type))) throw new Error(`${key} type codes must be unsigned 32-bit integers`);
+      return { type: item.type as number, ...(item.sub_type === undefined ? {} : { sub_type: item.sub_type as number }) };
+    });
+  };
+  const include = parseList("include");
+  const exclude = parseList("exclude");
+  return { ...(include === undefined ? {} : { include }), ...(exclude === undefined ? {} : { exclude }) };
+}
+
+function messageTypeLabel(type: number, subType: number): string {
+  const main = messageTypeDictionary.main.find((entry) => entry.code === type);
+  if (!main) return `未知类型(${type})`;
+  if (type === 49 && subType > 0) {
+    const app = messageTypeDictionary.appmsg.find((entry) => entry.code === subType);
+    return app ? `${app.label}(${subType})` : `应用消息(${subType})`;
+  }
+  return `${main.label}(${type})`;
+}
+
+async function cmdMessagesV2(client: WeChatClient, chatId: string, options: ListMessagesV2Options, all: boolean, jsonOutput: boolean) {
+  if (!Number.isInteger(options.limit) || (options.limit ?? 0) < 1 || (options.limit ?? 0) > 1000) throw new Error("--limit must be an integer from 1 to 1000");
+  if (!all) {
+    const page = await client.listMessagesV2(chatId, options);
+    if (jsonOutput) console.log(JSON.stringify(page, null, 2));
+    else renderMessagesV2(page.items);
     return;
   }
+  let first = true;
+  let interrupted = false;
+  const onInterrupt = () => { interrupted = true; };
+  process.on("SIGINT", onInterrupt);
+  try {
+    await readAllPages(
+      (nextCursor) => {
+        if (first) {
+          first = false;
+          const { cursor: startCursor, ...initial } = options;
+          return client.listMessagesV2(chatId, startCursor ? { cursor: startCursor } : initial);
+        }
+        return client.listMessagesV2(chatId, { cursor: nextCursor });
+      },
+      (token) => client.releaseReadSnapshotV2(token),
+      (page) => {
+        if (jsonOutput) console.log(JSON.stringify(page));
+        else renderMessagesV2(page.items);
+      },
+      () => interrupted,
+    );
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+  }
+}
 
+function renderMessagesV2(messages: MessageV2[]) {
   if (messages.length === 0) {
     console.log("No messages found.");
     return;
   }
-
-  // Display messages oldest-first for natural reading order
-  const sorted = [...messages].reverse();
-
-  // Compute column widths
-  const maxIdLen = Math.max(2, ...sorted.map(m => String(m.localId).length));
-  const maxTypeLen = Math.max(4, ...sorted.map(m => getMsgTypeLabel(m.type).length));
-  const formatSender = (m: (typeof sorted)[number]) => {
-    const name = m.senderName;
-    const id = m.sender;
-    if (name && id) return `${name}(${id.slice(0, 10)})`;
-    if (name) return name;
-    if (id) return id.slice(0, 10);
-    return "";
-  };
-  const maxSenderLen = Math.max(6, ...sorted.map(m => formatSender(m).length));
-  const hasAnyMention = sorted.some(m => m.isMentioned);
-  const atCol = hasAnyMention ? "@me  " : "";
-  const atHeader = hasAnyMention ? "@me".padEnd(5) : "";
-
-  // Header
-  console.log(`${"ID".padEnd(maxIdLen)}  ${"Time".padEnd(22)}  ${atHeader}${"Type".padEnd(maxTypeLen)}  ${"Sender".padEnd(maxSenderLen)}  Message`);
-  console.log("-".repeat(maxIdLen + 22 + maxTypeLen + maxSenderLen + (hasAnyMention ? 5 : 0) + 10));
-
-  for (const msg of sorted) {
-    const time = new Date(msg.timestamp).toLocaleString();
-    const typeLabel = getMsgTypeLabel(msg.type);
-    const id = String(msg.localId).padEnd(maxIdLen);
-    const mention = hasAnyMention ? (msg.isMentioned ? "Y" : "").padEnd(5) : "";
-    const sender = formatSender(msg).padEnd(maxSenderLen);
-    let preview = msg.content.length > 120 ? msg.content.slice(0, 120) + "..." : msg.content;
-    if (msg.reply) {
-      const rSender = msg.reply.sender ? `${msg.reply.sender}: ` : "";
-      const rSnippet = msg.reply.content.length > 40 ? msg.reply.content.slice(0, 40) + "..." : msg.reply.content;
-      preview = `[Re: ${rSender}${rSnippet}] ${preview}`;
+  for (const message of [...messages].sort((a, b) => {
+    if (a.timestamp === null) return b.timestamp === null ? 0 : 1;
+    if (b.timestamp === null) return -1;
+    return Date.parse(a.timestamp) - Date.parse(b.timestamp);
+  })) {
+    const time = message.timestamp === null ? "—" : new Date(message.timestamp).toLocaleString();
+    const label = messageTypeLabel(message.type, message.sub_type);
+    const sender = message.sender_display_name ?? message.sender_username ?? "";
+    const preview = message.content.length > 120 ? `${message.content.slice(0, 120)}...` : message.content;
+    console.log(`${message.server_id ?? "-"}  ${time}  ${label}  ${sender}  ${preview}`);
+    if (message.reference) {
+      const reference = message.reference;
+      const display = reference.display_name ? `名称=${reference.display_name}` : "名称=未知";
+      const identity = reference.sender_username ?? "身份缺失";
+      console.log(`  引用: ${display} 身份=${identity} 会话=${reference.chat_username ?? "未知"} ${reference.content}`);
     }
-
-    console.log(`${id}  ${time.padEnd(22)}  ${mention}${typeLabel.padEnd(maxTypeLen)}  ${sender}  ${preview}`);
+    if (message.forwarded_record) {
+      console.log(`  合并转发 [${message.forwarded_record.parse_status}]`);
+      for (const item of message.forwarded_record.items) {
+        const entryType = item.datatype === null
+          ? "内部类型缺失"
+          : messageTypeDictionary.forwarded_inner.find((entry) => entry.code === item.datatype)?.label ?? `未知内部类型(${item.datatype})`;
+        const timeLabel = item.sourcetime ?? item.src_msg_create_time;
+        const sourceHash = item.dataitem_source_hash_username ? ` source hash=${item.dataitem_source_hash_username}` : "";
+        const details = [item.sourcename, timeLabel, item.from_new_msg_id].filter(Boolean).join("; ");
+        console.log(`    ${entryType}(${item.datatype ?? "?"}) ${item.datadesc ?? ""} — ${details}${sourceHash}`);
+      }
+    }
   }
-
   console.log(`\n${messages.length} message(s) shown.`);
 }
 
 async function cmdMedia(
-  client: WeChatClient, chatId: string, localId: number, outputPath?: string,
+  client: WeChatClient, chatId: string, localId: string | undefined, outputPath?: string,
   quality: "full" | "thumbnail" | "best" = "best",
+  serverId?: string,
 ) {
-  const result = await client.getMedia(chatId, localId, quality);
+  let resolvedServerId = serverId;
+  if (resolvedServerId === undefined && localId !== undefined) {
+    let cursor: string | undefined;
+    let releaseToken: string | null = null;
+    const matches: MessageV2[] = [];
+    try {
+      do {
+        const page = await client.listMessagesV2(chatId, { cursor });
+        releaseToken = page.release_token ?? releaseToken;
+        matches.push(...page.items.filter((message) => message.local_id === localId));
+        cursor = page.next_cursor ?? undefined;
+      } while (cursor !== undefined);
+    } finally {
+      if (releaseToken) await client.releaseReadSnapshotV2(releaseToken);
+    }
+    if (matches.length !== 1) throw new Error(matches.length ? "Local ID is ambiguous in this chat." : "Local ID was not found in this chat.");
+    resolvedServerId = matches[0].server_id ?? undefined;
+    if (!resolvedServerId || resolvedServerId === "0") throw new Error("The matching message has no non-zero server_id; media cannot be located safely.");
+  }
+  if (resolvedServerId === undefined) throw new Error("Provide a local ID or native server ID.");
+  const result = await client.getMessageMediaV2(resolvedServerId, { chat_username: chatId, quality });
 
   if (result.type === "unsupported") {
     console.error("No media found for this message (unsupported type or not found).");
@@ -769,19 +953,6 @@ async function cmdMedia(
   }
 }
 
-async function cmdFind(client: WeChatClient, name: string) {
-  const chats = await client.findChats(name);
-  if (chats.length === 0) {
-    console.log(`No chats found matching "${name}"`);
-    return;
-  }
-
-  console.log(`Found ${chats.length} matching chats:\n`);
-  for (const chat of chats) {
-    console.log(`  ${chat.id}: ${chat.name}`);
-  }
-}
-
 async function cmdChatOpen(client: WeChatClient, chatId: string, clearUnreads?: boolean) {
   console.log(`Opening chat ${chatId}...`);
   const result = await client.openChat(chatId, clearUnreads);
@@ -797,73 +968,37 @@ async function cmdChatOpen(client: WeChatClient, chatId: string, clearUnreads?: 
   }
 }
 
-async function cmdContacts(client: WeChatClient, limit: number = 200, offset: number = 0, json: boolean = false) {
-  const contacts = await client.listContacts(limit, offset);
-
-  if (json) {
-    console.log(JSON.stringify(contacts, null, 2));
-    return;
+async function cmdSend(client: WeChatClient, chatId: string, text?: string, image?: { data: string; mimeType: string }, file?: { data: string; filename: string; sha256: string; size: number }, expectedAccountUsername?: string, jsonOutput = false) {
+  if (text === undefined && image === undefined && file === undefined) {
+    throw new Error("At least one of --text, --image, or --file is required.");
   }
-
-  if (contacts.length === 0) {
-    console.log("No contacts found. Make sure you're logged in.");
-    return;
-  }
-
-  console.log(`Found ${contacts.length} contact(s):\n`);
-
-  const maxIdLen = Math.max(10, ...contacts.map(c => c.username.length));
-  const idHeader = "Username".padEnd(maxIdLen);
-  console.log(`${idHeader}  Type        Name`);
-  console.log("-".repeat(maxIdLen + 30));
-  for (const c of contacts) {
-    const id = c.username.padEnd(maxIdLen);
-    const type = c.contactType.padEnd(10);
-    const name = c.remark ? `${c.nickName} (${c.remark})` : c.nickName;
-    console.log(`${id}  ${type}  ${name}`);
-  }
-}
-
-async function cmdContactsFind(client: WeChatClient, name: string, json: boolean = false) {
-  const contacts = await client.findContacts(name);
-
-  if (json) {
-    console.log(JSON.stringify(contacts, null, 2));
-    return;
-  }
-
-  if (contacts.length === 0) {
-    console.log(`No contacts found matching "${name}"`);
-    return;
-  }
-
-  console.log(`Found ${contacts.length} matching contact(s):\n`);
-  for (const c of contacts) {
-    const name = c.remark ? `${c.nickName} (${c.remark})` : c.nickName;
-    console.log(`  ${c.username}: ${name} [${c.contactType}]`);
-  }
-}
-
-async function cmdSend(client: WeChatClient, chatId: string, text?: string, image?: { data: string; mimeType: string }, file?: { data: string; filename: string }) {
   const what = file ? `file "${file.filename}"` : image ? "image" : "message";
-  console.log(`Sending ${what} to ${chatId}...`);
-  const result = await client.sendMessage({
-    chatId,
-    ...(text ? { text } : {}),
-    ...(image ? { image } : {}),
+  if (!jsonOutput) console.log(`Sending ${what} to ${chatId}...`);
+  const payload = {
+    chat_username: chatId,
+    ...(expectedAccountUsername === undefined ? {} : { expected_account_username: expectedAccountUsername }),
+    ...(text === undefined ? {} : { text }),
+    ...(image ? { image: { data: image.data, mime_type: image.mimeType } } : {}),
     ...(file ? { file } : {}),
-  });
-
-  if (result.success) {
-    console.log("Message sent successfully!");
-    if (result.messageId) {
-      console.log(`Message ID: ${result.messageId}`);
-    }
-  } else if (result.error === "NOT_LOGGED_IN") {
-    console.error("Not logged in. Run: pnpm cli auth login");
+  };
+  let result: SendMessageV2Result;
+  try {
+    result = await client.sendMessageV2(payload as Parameters<WeChatClient["sendMessageV2"]>[0]);
+  } catch (error) {
+    if (!(error instanceof SendMessageV2Error)) throw error;
+    for (const ignored of error.result.ignored_fields) console.error(`Ignored send field: ${ignored}`);
+    if (jsonOutput) console.log(JSON.stringify(error.result));
+    console.error(`Failed to send message: ${error.result.error_code ?? "unconfirmed"}`);
     process.exit(1);
+  }
+
+  for (const ignored of result.ignored_fields) console.error(`Ignored send field: ${ignored}`);
+  if (jsonOutput) console.log(JSON.stringify(result));
+  if (result.success) {
+    if (jsonOutput) return;
+    console.log("Message UI confirmed (not a delivery receipt).");
   } else {
-    console.error(`Failed to send message: ${result.error || "Unknown error"}`);
+    console.error(`Failed to send message: ${result.error_code ?? "unconfirmed"}`);
     process.exit(1);
   }
 }
@@ -1058,6 +1193,13 @@ async function cmdUpdate() {
 // ============================================
 
 async function cmdUp(opts: { proxy?: string } = {}) {
+  const containerConfig = readContainerConfig();
+  if (containerConfig) {
+    if (opts.proxy) throw new Error("--proxy is not supported with container.json; configure the proxy in the Compose environment instead.");
+    execFileSync("docker", [...composeArgs(containerConfig), "up", "-d"], { stdio: "inherit" });
+    await waitForServer(() => composeRunning(containerConfig));
+    return;
+  }
   let image = getImageTag();
 
   // Check if container already exists
@@ -1131,26 +1273,16 @@ async function cmdUp(opts: { proxy?: string } = {}) {
   dockerArgs.push(image);
 
   try {
-    execSync(`docker ${dockerArgs.join(" ")}`, { stdio: "inherit" });
+    execFileSync("docker", dockerArgs, { stdio: "inherit" });
     console.log(`\nContainer started successfully!`);
     console.log(`API: http://localhost:${DEFAULT_PORT}`);
     printNoVncUrl();
     console.log(`\nWaiting for server to be ready...`);
 
-    for (let i = 0; i < 30; i++) {
-      try {
-        const response = await fetch(`http://localhost:${DEFAULT_PORT}/health`);
-        if (response.ok) {
-          console.log("Server is ready!");
-          return;
-        }
-      } catch {
-        // Not ready yet
-      }
-      await new Promise(r => setTimeout(r, 1000));
-      process.stdout.write(".");
-    }
-    console.log("\nServer did not become ready in time. Check logs with: wx logs");
+    await waitForServer(() => {
+      try { return Boolean(execFileSync("docker", ["ps", "-q", "-f", `name=^${CONTAINER_NAME}$`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); }
+      catch { return false; }
+    });
   } catch (error) {
     console.error("Failed to start container:", error);
     process.exit(1);
@@ -1158,6 +1290,12 @@ async function cmdUp(opts: { proxy?: string } = {}) {
 }
 
 async function cmdDown() {
+  const containerConfig = readContainerConfig();
+  if (containerConfig) {
+    execFileSync("docker", [...composeArgs(containerConfig), "stop"], { stdio: "inherit" });
+    console.log("Compose services stopped; containers and volumes were retained.");
+    return;
+  }
   console.log(`Stopping container ${CONTAINER_NAME}...`);
   try {
     execSync(`docker stop ${CONTAINER_NAME}`, { stdio: "inherit" });
@@ -1168,9 +1306,32 @@ async function cmdDown() {
   }
 }
 
+function composeRunning(config: ContainerConfig): boolean {
+  return Boolean(execFileSync("docker", [...composeArgs(config), "ps", "--status", "running", "--quiet", "agent-wechat"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+}
+
+async function waitForServer(isRunning: () => boolean): Promise<void> {
+  console.log("\nWaiting for server to be ready...");
+  const serverUrl = getConfig().serverUrl;
+  for (let i = 0; i < 30; i++) {
+    if (!isRunning()) throw new Error("Container process exited before the server became ready. Check logs with: wx logs");
+    try {
+      const response = await fetch(`${serverUrl}/health`, { signal: AbortSignal.timeout(2_000) });
+      if (response.ok) { console.log("Server is ready!"); return; }
+    } catch { /* retry until the bounded deadline */ }
+    if (i < 29) await new Promise((resolve) => setTimeout(resolve, 1000));
+    process.stdout.write(".");
+  }
+  throw new Error("Server did not become ready in time. Check logs with: wx logs");
+}
+
 async function cmdLogs() {
+  const containerConfig = readContainerConfig();
+  const args = containerConfig
+    ? [...composeArgs(containerConfig), "logs", "-f", "agent-wechat"]
+    : ["logs", "-f", CONTAINER_NAME];
   try {
-    const logs = spawn("docker", ["logs", "-f", CONTAINER_NAME], {
+    const logs = spawn("docker", args, {
       stdio: "inherit",
     });
     logs.on("error", () => {

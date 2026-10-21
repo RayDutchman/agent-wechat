@@ -1,27 +1,50 @@
 import type {
-  Chat,
-  Contact,
-  Message,
-  SendResult,
   MediaResult,
   LoginResult,
   LoginSubscriptionEvent,
+  DataChangedEvent,
+  ChangeSubscriptionStatus,
   OpenChatResult,
   Session,
-  SendParams,
+  ContactKind,
+  ContactV2,
+  GroupMemberV2,
+  ChatV2,
+  ReadPageV2,
+  MessageV2,
 } from "./types/index.js";
+import { accountObservationSchema, sendMessageV2RequestSchema, sendMessageV2ResultSchema } from "./schemas/index.js";
+import type { AccountObservation as AccountObservationSchema, SendMessageV2Request as SendMessageV2RequestSchema, SendMessageV2Result } from "./schemas/index.js";
 
-// Re-export Status/LoginState types used by the client
-export type LoginState = { status: string };
-export type StatusResponse = {
-  container: string;
-  loginState: LoginState;
-  version: string;
+export type AccountObservation = AccountObservationSchema;
+export type SendMessageV2Request = SendMessageV2RequestSchema;
+export type SendMessageV2Params = SendMessageV2Request;
+export type { SendMessageV2Result };
+
+export class SendMessageV2Error extends Error {
+  constructor(readonly status: number, readonly result: SendMessageV2Result) {
+    super(`${status} send preflight rejected: ${result.error_code ?? "unknown"}`);
+    this.name = "SendMessageV2Error";
+  }
+}
+
+type SendMessageV2ErrorCode = Exclude<SendMessageV2Result["error_code"], null>;
+const sendPreflightCodesByStatus: Record<number, readonly SendMessageV2ErrorCode[]> = {
+  400: ["invalid_parameter", "invalid_filename", "invalid_encoding", "payload_mismatch"],
+  409: ["account_mismatch", "scope_changed"],
+  413: ["payload_too_large"],
+  500: ["temp_storage_failed"],
+  503: ["identity_unavailable", "not_logged_in", "login_unverified", "target_unavailable", "deadline_exceeded"],
 };
-export type AuthStatus = {
-  status: "logged_in" | "logged_out" | "app_not_running" | "unknown";
-  loggedInUser?: string;
-};
+
+function isKnownPreflightHttpResult(status: number, result: SendMessageV2Result): boolean {
+  return result.success === false
+    && result.commit_attempted === false
+    && result.ui_confirmed === false
+    && result.failure_stage === "preflight"
+    && result.error_code !== null
+    && (sendPreflightCodesByStatus[status]?.includes(result.error_code) ?? false);
+}
 
 export type VoiceJob = {
   jobId: string;
@@ -43,6 +66,169 @@ export interface WeChatClientOptions {
   token?: string;
   sessionId?: string;
   headers?: Record<string, string>;
+}
+
+export interface SubscribeChangesOptions {
+  signal?: AbortSignal;
+  onStatus?: (status: ChangeSubscriptionStatus) => void;
+}
+
+export interface ReadV2Options {
+  q?: string;
+  kind?: ContactKind;
+  limit?: number;
+  cursor?: string;
+  expected_account_username?: string;
+}
+
+export type MessageTypeFilter = { type: number; sub_type?: number };
+export interface ListMessagesV2Options {
+  limit?: number;
+  cursor?: string;
+  order?: "asc" | "desc";
+  include?: MessageTypeFilter[];
+  exclude?: MessageTypeFilter[];
+  expected_account_username?: string;
+}
+export interface MessageLocatorOptions {
+  chat_username?: string;
+  expected_account_username?: string;
+}
+
+type ChangeConnection = {
+  next: () => Promise<DataChangedEvent | null>;
+  close: () => void;
+};
+
+const MAX_CHANGE_FRAME_CHARS = 256;
+
+function isDataChangedEvent(data: unknown): data is DataChangedEvent {
+  if (typeof data !== "string" || data.length > MAX_CHANGE_FRAME_CHARS) return false;
+  try {
+    const parsed: unknown = JSON.parse(data);
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 1 &&
+      (parsed as { type?: unknown }).type === "data_changed"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function openChangeConnection(url: string, signal?: AbortSignal): Promise<ChangeConnection | null> {
+  if (signal?.aborted) return Promise.resolve(null);
+
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(url);
+  } catch {
+    return Promise.resolve(null);
+  }
+
+  return new Promise((resolve) => {
+    let opened = false;
+    let settled = false;
+    let closed = false;
+    let eventPending = false;
+    let wakeReader: (() => void) | undefined;
+
+    const wake = () => {
+      const wakeReaderNow = wakeReader;
+      wakeReader = undefined;
+      wakeReaderNow?.();
+    };
+    const removeListeners = () => {
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      socket.removeEventListener("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const closeSocket = () => {
+      try {
+        socket.close();
+      } catch {
+        // A closing/failed native WebSocket may reject close(); treat it as closed.
+      }
+    };
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      if (!opened && !settled) {
+        settled = true;
+        removeListeners();
+        resolve(null);
+      }
+      wake();
+    };
+    const onOpen = () => {
+      if (closed || settled) return;
+      opened = true;
+      settled = true;
+      resolve({
+        next: async () => {
+          while (!eventPending && !closed && !signal?.aborted) {
+            await new Promise<void>((wakeNext) => { wakeReader = wakeNext; });
+          }
+          if (eventPending) {
+            eventPending = false;
+            return { type: "data_changed" };
+          }
+          return null;
+        },
+        close: () => {
+          finish();
+          removeListeners();
+          closeSocket();
+        },
+      });
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (!eventPending && isDataChangedEvent(event.data)) {
+        eventPending = true;
+        wake();
+      }
+    };
+    const onClose = () => {
+      finish();
+      if (opened) removeListeners();
+    };
+    const onError = () => {
+      finish();
+      closeSocket();
+      if (opened) removeListeners();
+    };
+    const onAbort = () => {
+      finish();
+      closeSocket();
+      removeListeners();
+    };
+
+    socket.addEventListener("open", onOpen);
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose);
+    socket.addEventListener("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+function waitForReconnect(delayMs: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const finish = (elapsed: boolean) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(elapsed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 function normalizeUrl(base: string): string {
@@ -95,6 +281,12 @@ export class WeChatClient {
     return res.json() as Promise<T>;
   }
 
+  private async getBytes(path: string): Promise<Uint8Array> {
+    const res = await fetch(`${this.base}${path}`, { headers: this.headers });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   private async post<T>(path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${this.base}${path}`, {
       method: "POST",
@@ -122,17 +314,8 @@ export class WeChatClient {
 
   // ---- Status ----
 
-  async status(): Promise<StatusResponse> {
-    return this.get("/api/status");
-  }
-
-  async loginState(): Promise<LoginState> {
-    const s = await this.status();
-    return s.loginState;
-  }
-
-  async authStatus(): Promise<AuthStatus> {
-    return this.get("/api/status/auth");
+  async getAccount(): Promise<AccountObservation> {
+    return accountObservationSchema.parse(await this.get("/api/v2/account"));
   }
 
   async login(): Promise<LoginResult> {
@@ -145,21 +328,6 @@ export class WeChatClient {
 
   // ---- Chats ----
 
-  async listChats(
-    limit?: number,
-    offset?: number,
-  ): Promise<Chat[]> {
-    return this.get(`/api/chats${qs({ limit, offset })}`);
-  }
-
-  async getChat(id: string): Promise<Chat | null> {
-    return this.get(`/api/chats/${encodeURIComponent(id)}`);
-  }
-
-  async findChats(name: string): Promise<Chat[]> {
-    return this.get(`/api/chats/find${qs({ name })}`);
-  }
-
   async openChat(
     chatId: string,
     clearUnreads?: boolean,
@@ -171,41 +339,69 @@ export class WeChatClient {
 
   // ---- Contacts ----
 
-  async listContacts(
-    limit?: number,
-    offset?: number,
-  ): Promise<Contact[]> {
-    return this.get(`/api/contacts${qs({ limit, offset })}`);
+  async listContactsV2(options: ReadV2Options = {}): Promise<ReadPageV2<ContactV2>> {
+    return this.get(`/api/v2/contacts${qs({ ...options })}`);
   }
 
-  async findContacts(name: string): Promise<Contact[]> {
-    return this.get(`/api/contacts/find${qs({ name })}`);
+  async listChatsV2(options: Omit<ReadV2Options, "kind"> = {}): Promise<ReadPageV2<ChatV2>> {
+    return this.get(`/api/v2/chats${qs(options)}`);
+  }
+
+  async getChatV2(username: string): Promise<ChatV2> {
+    return this.get(`/api/v2/chats/${encodeURIComponent(username)}`);
+  }
+
+  async listGroupMembersV2(roomUsername: string, options: Omit<ReadV2Options, "q" | "kind"> = {}): Promise<ReadPageV2<GroupMemberV2>> {
+    return this.get(`/api/v2/chats/${encodeURIComponent(roomUsername)}/members${qs(options)}`);
+  }
+
+  async listMessagesV2(chatUsername: string, options: ListMessagesV2Options = {}): Promise<ReadPageV2<MessageV2>> {
+    const params: Record<string, unknown> = { ...options };
+    if (options.include !== undefined) params.include = JSON.stringify(options.include);
+    if (options.exclude !== undefined) params.exclude = JSON.stringify(options.exclude);
+    return this.get(`/api/v2/chats/${encodeURIComponent(chatUsername)}/messages${qs(params)}`);
+  }
+
+  async getMessageV2(serverId: string, options: MessageLocatorOptions = {}): Promise<MessageV2> {
+    return this.get(`/api/v2/messages/${encodeURIComponent(serverId)}${qs({ ...options })}`);
+  }
+
+  async getMessageMediaV2(serverId: string, options: MessageLocatorOptions & { quality?: "legacy" | "full" | "standard" | "thumbnail" | "best" } = {}): Promise<MediaResult> {
+    return this.get(`/api/v2/messages/${encodeURIComponent(serverId)}/media${qs({ ...options })}`);
+  }
+
+  async getMessageVoiceV2(serverId: string, options: MessageLocatorOptions = {}): Promise<Uint8Array> {
+    return this.getBytes(`/api/v2/messages/${encodeURIComponent(serverId)}/voice${qs({ ...options })}`);
+  }
+
+  async releaseReadSnapshotV2(token: string): Promise<{ released: boolean }> {
+    return this.del(`/api/v2/read-snapshots/${encodeURIComponent(token)}`);
   }
 
   // ---- Messages ----
 
-  async listMessages(
-    chatId: string,
-    limit?: number,
-    offset?: number,
-  ): Promise<Message[]> {
-    return this.get(
-      `/api/messages/${encodeURIComponent(chatId)}${qs({ limit, offset })}`,
-    );
-  }
-
-  async getMedia(
-    chatId: string,
-    localId: number,
-    quality?: "full" | "standard" | "thumbnail" | "best",
-  ): Promise<MediaResult> {
-    return this.get(
-      `/api/messages/${encodeURIComponent(chatId)}/media/${localId}${qs({ quality })}`,
-    );
-  }
-
-  async sendMessage(params: SendParams): Promise<SendResult> {
-    return this.post("/api/messages/send", params);
+  async sendMessageV2(params: SendMessageV2Params): Promise<SendMessageV2Result> {
+    const request = sendMessageV2RequestSchema.parse(params);
+    const response = await fetch(`${this.base}/api/v2/messages/send`, {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(body);
+      } catch {
+        throw new Error(`${response.status} ${response.statusText}: ${body}`);
+      }
+      const parsed = sendMessageV2ResultSchema.safeParse(decoded);
+      if (parsed.success && isKnownPreflightHttpResult(response.status, parsed.data)) {
+        throw new SendMessageV2Error(response.status, parsed.data);
+      }
+      throw new Error(`${response.status} ${response.statusText}: ${body}`);
+    }
+    return sendMessageV2ResultSchema.parse(await response.json());
   }
 
   async createVoiceJob(chatId: string, audio: Uint8Array, idempotencyKey: string): Promise<VoiceJob> {
@@ -225,6 +421,66 @@ export class WeChatClient {
 
   async cancelVoiceJob(jobId: string): Promise<VoiceJob> {
     return this.post(`/api/messages/voice/${encodeURIComponent(jobId)}/cancel`);
+  }
+
+  /**
+   * Stream broad data-change hints. Reconnection never triggers a read; callers
+   * decide whether and when to reconcile their own data.
+   */
+  async *subscribeChanges(
+    options: SubscribeChangesOptions = {},
+  ): AsyncGenerator<DataChangedEvent, void, void> {
+    const { signal, onStatus } = options;
+    const reportStatus = (status: ChangeSubscriptionStatus) => onStatus?.(status);
+    if (signal?.aborted) {
+      reportStatus("closed");
+      return;
+    }
+
+    const url = new URL(`${this.base}/api/ws/events`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    if (this.wsToken) url.searchParams.set("token", this.wsToken);
+
+    let reconnectDelayMs = 250;
+    let attempted = false;
+    let statusReported = false;
+    let activeConnection: ChangeConnection | null = null;
+    try {
+      while (!signal?.aborted) {
+        if (!statusReported) reportStatus(attempted ? "reconnecting" : "connecting");
+        statusReported = false;
+        attempted = true;
+
+        activeConnection = await openChangeConnection(url.toString(), signal);
+        if (signal?.aborted) break;
+        if (!activeConnection) {
+          reportStatus("reconnecting");
+          statusReported = true;
+          if (!(await waitForReconnect(reconnectDelayMs, signal))) break;
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000);
+          continue;
+        }
+
+        reportStatus("connected");
+        reconnectDelayMs = 250;
+        while (!signal?.aborted) {
+          const event = await activeConnection.next();
+          if (!event) break;
+          yield event;
+        }
+        activeConnection.close();
+        activeConnection = null;
+        if (signal?.aborted) break;
+
+        reportStatus("reconnecting");
+        statusReported = true;
+        if (!(await waitForReconnect(reconnectDelayMs, signal))) break;
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000);
+      }
+    } finally {
+      activeConnection?.close();
+      reportStatus("closed");
+    }
   }
 
   // ---- Debug ----

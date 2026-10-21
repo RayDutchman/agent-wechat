@@ -2,6 +2,94 @@ use crate::db::get_db;
 use crate::ia::types::Session;
 use rusqlite::params;
 
+fn positive_setting(name: &str, value: Option<&str>, default: u32) -> Result<u32, String> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(default),
+        Some(v) => parse_positive(v).ok_or_else(|| format!("Invalid {name}: {v}")),
+    }
+}
+
+fn parse_positive(value: &str) -> Option<u32> {
+    if !value.bytes().all(|b| b.is_ascii_digit()) || value.starts_with('0') { return None; }
+    value.parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+fn screen_depth_from(value: Option<&str>) -> Result<u32, String> {
+    match value.filter(|v| !v.is_empty()) {
+        None => Ok(24),
+        Some(v) if matches!(v, "8" | "16" | "24") => Ok(v.parse().unwrap()),
+        Some(v) => Err(format!("Invalid WECHAT_SCREEN_DEPTH: {v}")),
+    }
+}
+
+struct StartConfig { width: u32, height: u32, depth: u32, dpi: u32, locale: String, tz: String }
+
+fn validate_start_config() -> Result<StartConfig, String> {
+    let get = |name: &str| std::env::var(name).ok();
+    let width = positive_setting("WECHAT_SCREEN_WIDTH", get("WECHAT_SCREEN_WIDTH").as_deref(), 1280)?;
+    let height = positive_setting("WECHAT_SCREEN_HEIGHT", get("WECHAT_SCREEN_HEIGHT").as_deref(), 800)?;
+    let depth = screen_depth_from(get("WECHAT_SCREEN_DEPTH").as_deref())?;
+    let dpi = positive_setting("WECHAT_SCREEN_DPI", get("WECHAT_SCREEN_DPI").as_deref(), 100)?;
+    let locale = resolve_locale(get("WECHAT_LOCALE").filter(|v| !v.is_empty()).as_deref())?;
+    let tz = resolve_tz(get("TZ").filter(|v| !v.is_empty()).as_deref())?;
+    Ok(StartConfig { width, height, depth, dpi, locale, tz })
+}
+
+fn resolve_locale(requested: Option<&str>) -> Result<String, String> {
+    let requested = requested.unwrap_or("C.UTF-8");
+    if !requested.chars().all(|c| c.is_ascii_alphanumeric() || "_.@+-".contains(c)) {
+        return Err(format!("Invalid WECHAT_LOCALE: {requested}"));
+    }
+    let output = std::process::Command::new("locale").arg("-a").output()
+        .map_err(|e| format!("Unable to query installed locales: {e}"))?;
+    if !output.status.success() { return Err("Unable to query installed locales".to_string()); }
+    let available = String::from_utf8_lossy(&output.stdout);
+    if let Some(installed) = available.lines().find(|line| *line == requested) { return Ok(installed.to_string()); }
+    let alias = match requested { "C.UTF-8" => Some("C.utf8"), "C.utf8" => Some("C.UTF-8"), _ => None };
+    alias.and_then(|name| available.lines().find(|line| *line == name))
+        .map(str::to_string).ok_or_else(|| format!("Unavailable WECHAT_LOCALE: {requested}"))
+}
+
+fn resolve_tz(requested: Option<&str>) -> Result<String, String> {
+    let tz = requested.unwrap_or("UTC");
+    if valid_tz_name(tz) && (tz == "UTC" || std::path::Path::new("/usr/share/zoneinfo").join(tz).is_file()) { Ok(tz.to_string()) }
+    else { Err(format!("Unavailable TZ: {tz}")) }
+}
+
+fn valid_tz_name(tz: &str) -> bool {
+    (tz == "UTC" || tz.chars().all(|c| c.is_ascii_alphanumeric() || "_./+-".contains(c)))
+        && !tz.starts_with('/')
+        && !tz.contains('\\')
+        && tz.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_positive, positive_setting, resolve_tz, screen_depth_from, valid_tz_name};
+
+    #[test]
+    fn display_settings_accept_positive_values_and_default_invalid_values() {
+        assert_eq!(parse_positive("1280"), Some(1280));
+        assert_eq!(parse_positive("0"), None);
+        assert_eq!(parse_positive("01"), None);
+        assert_eq!(parse_positive("4294967296"), None);
+        assert_eq!(positive_setting("width", Some(""), 1280).unwrap(), 1280);
+        assert!(positive_setting("width", Some("01"), 1280).is_err());
+        assert_eq!(screen_depth_from(Some("16")).unwrap(), 16);
+        assert_eq!(screen_depth_from(Some("24")).unwrap(), 24);
+        assert!(screen_depth_from(Some("32")).is_err());
+        assert!(screen_depth_from(Some("08")).is_err());
+        assert_eq!(screen_depth_from(Some("")).unwrap(), 24);
+        assert!(resolve_tz(Some("../UTC")).is_err());
+        assert!(resolve_tz(Some("Etc/../UTC")).is_err());
+        assert!(valid_tz_name("Etc/UTC"));
+        assert!(valid_tz_name("Etc/GMT+1"));
+        assert!(!valid_tz_name("UTC;touch"));
+        assert!(!valid_tz_name("UTC$(id)"));
+        assert!(!valid_tz_name("UTC name"));
+    }
+}
+
 /// Convert a DB row to a Session.
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -148,6 +236,8 @@ pub async fn start_session(id_or_name: &str) -> Result<Session, String> {
         return Ok(session);
     }
 
+    let config = validate_start_config()?;
+
     // Update status to 'starting' — scoped so MutexGuard drops before await
     {
         let db = get_db();
@@ -162,12 +252,14 @@ pub async fn start_session(id_or_name: &str) -> Result<Session, String> {
     let display = &session.display;
     let linux_user = &session.linux_user;
     let home_dir = format!("/home/{linux_user}");
+    let screen = format!("{}x{}x{}", config.width, config.height, config.depth);
+    let dpi = config.dpi.to_string();
 
     // 1. Start Xvfb
     let display_num = display.trim_start_matches(':');
     let _ = std::fs::remove_file(format!("/tmp/.X{display_num}-lock"));
     let _ = std::process::Command::new("Xvfb")
-        .args([display.as_str(), "-screen", "0", "1280x800x24"])
+        .args([display.as_str(), "-screen", "0", screen.as_str(), "-dpi", dpi.as_str(), "-nolisten", "tcp"])
         .spawn();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -203,12 +295,15 @@ pub async fn start_session(id_or_name: &str) -> Result<Session, String> {
 
     // 5. VNC (localhost only — auth enforced by agent-server proxy)
     let vnc_port = session.vnc_port.to_string();
-    let _ = std::process::Command::new("x11vnc")
-        .args(["-display", display.as_str(), "-forever", "-nopw", "-shared", "-viewonly", "-xkb", "-rfbport", &vnc_port, "-listen", "127.0.0.1"])
-        .spawn();
+    if std::env::var("ENABLE_VNC").unwrap_or_else(|_| "1".to_string()) == "1" {
+        let _ = std::process::Command::new("x11vnc")
+            .args(["-display", display.as_str(), "-forever", "-nopw", "-shared", "-viewonly", "-xkb", "-rfbport", &vnc_port, "-listen", "127.0.0.1", "-listenv6", "::1"])
+            .spawn();
+    }
 
     // 5b. noVNC (websockify on localhost only — proxied via agent-server with auth)
-    if std::path::Path::new("/opt/novnc").exists() {
+    if std::path::Path::new("/opt/novnc").exists()
+        && std::env::var("ENABLE_VNC").unwrap_or_else(|_| "1".to_string()) == "1" {
         let websockify_port = session.vnc_port + 180; // VNC 5900 -> websockify 6080
         let novnc_bind = format!("127.0.0.1:{}", websockify_port);
         let vnc_target = format!("localhost:{}", session.vnc_port);
@@ -221,7 +316,8 @@ pub async fn start_session(id_or_name: &str) -> Result<Session, String> {
     let _ = std::process::Command::new("su")
         .args(["-s", "/bin/bash", "-c",
             &format!(
-                "DISPLAY={display} DBUS_SESSION_BUS_ADDRESS={dbus_address} QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 GTK_MODULES=gail:atk-bridge HOME={home_dir} /usr/bin/wechat &"
+                "LANG={} LC_ALL={} LC_CTYPE={} TZ={} DISPLAY={display} DBUS_SESSION_BUS_ADDRESS={dbus_address} QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 GTK_MODULES=gail:atk-bridge HOME={home_dir} /usr/bin/wechat &",
+                config.locale, config.locale, config.locale, config.tz
             ),
             linux_user.as_str()])
         .spawn();

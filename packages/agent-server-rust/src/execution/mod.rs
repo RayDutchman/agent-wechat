@@ -64,7 +64,28 @@ where
     PA: Send,
 {
     let _gui_guard = acquire_gui_guard().await;
+    run_execution_loop_locked(plan, params, context, emit, cancel).await
+}
 
+/// The same loop as [`run_execution_loop`] without taking the shared GUI guard.
+///
+/// The caller must already hold a [`GuiGuard`] — normally the one
+/// [`acquire_gui_guard`] returned. `PLAN_LOCK` is not reentrant, so an operation
+/// that keeps one guard across several stages (an identity fence, the plan, a
+/// re-check) runs the loop through here; calling [`run_execution_loop`] while
+/// holding the guard would wait on the lock the caller already holds.
+pub async fn run_execution_loop_locked<P, PS, PA>(
+    plan: &P,
+    params: &PA,
+    context: &mut Context,
+    emit: &(dyn Fn(SubscriptionEvent) + Send + Sync),
+    cancel: CancellationToken,
+) -> (ExecutionResult, PS)
+where
+    P: crate::plans::Plan<PlanState = PS, Params = PA>,
+    PS: Send,
+    PA: Send,
+{
     let mut plan_state = plan.initial_plan_state();
     let session_id = context.session_id.clone();
 
@@ -239,13 +260,10 @@ where
             )
             .await;
 
-        tracing::debug!(
-            "[exec] selected action: {}",
-            selected
-                .as_ref()
-                .map(|s| format!("{:?}", s.action))
-                .unwrap_or_else(|| "none".to_string())
-        );
+        // Logged without the payload: `Action::Type` carries the message text
+        // and `Action::Sequence` carries whole sub-actions, so formatting the
+        // action itself would put an outgoing message in the log.
+        log_selected_action(selected.as_ref());
 
         // 7. EXECUTE: run the action (emits fire inline via callback)
         if let Some(sel) = &selected {
@@ -264,7 +282,7 @@ where
         if selected.is_none() {
             return (ExecutionResult {
                 success: false,
-                error: Some("No action selected".to_string()),
+                error: Some(stuck_reason(plan, &plan_state)),
             }, plan_state);
         }
     }
@@ -273,4 +291,334 @@ where
         success: false,
         error: Some("Max steps reached".to_string()),
     }, plan_state)
+}
+
+/// The error a run that selected no action reports.
+///
+/// The plan may name a stable short reason for stopping, and that reason is what
+/// the run reports; a plan that names none keeps the historical text. The reason
+/// is a fixed key the plan chose, never composed from the request, so nothing
+/// about a chat, a message or driver output reaches it.
+fn stuck_reason<P, PS>(plan: &P, plan_state: &PS) -> String
+where
+    P: crate::plans::Plan<PlanState = PS>,
+{
+    plan.get_failure_reason(plan_state)
+        .unwrap_or_else(|| "No action selected".to_string())
+}
+
+/// Log the selected action without its payload.
+///
+/// `Action::Type` carries the message text and `Action::Sequence` carries whole
+/// sub-actions, so a message body would reach the log through
+/// `format!("{action:?}")`. Only [`describe_action`]'s redacted description is
+/// written.
+fn log_selected_action(selected: Option<&SelectedAction>) {
+    match selected {
+        Some(selected) => {
+            tracing::debug!("[exec] selected action: {}", describe_action(&selected.action))
+        }
+        None => tracing::debug!("[exec] selected action: none"),
+    }
+}
+
+/// A log-safe description of an action: its kind and, for a sequence, how many
+/// steps it holds. It never includes text, selectors, coordinates or event
+/// payloads.
+fn describe_action(action: &Action) -> String {
+    match action {
+        Action::ClickSelector { .. } => "click_selector".to_string(),
+        Action::ClickCoords { .. } => "click_coords".to_string(),
+        Action::Type { .. } => "type_text".to_string(),
+        Action::Key { .. } => "key".to_string(),
+        Action::Scroll { .. } => "scroll".to_string(),
+        Action::Wait { .. } => "wait".to_string(),
+        Action::Emit { .. } => "emit".to_string(),
+        Action::Sequence { actions } => format!("sequence({})", actions.len()),
+    }
+}
+
+#[cfg(test)]
+mod stuck_reason_tests {
+    use super::*;
+    use crate::plans::send_message::{
+        SendMessagePhase, SendMessagePlan, SendMessagePlanState, SEND_FAIL_CHAT_NOT_OPEN,
+        SEND_FAIL_CHAT_SELECTION_FAILED,
+    };
+
+    /// The plan state of a run that stopped, carrying the reason the plan
+    /// recorded. Everything else is left at its initial value, exactly as the
+    /// two refusing branches leave it.
+    fn stopped(reason: Option<&str>) -> SendMessagePlanState {
+        SendMessagePlanState {
+            phase: SendMessagePhase::Opening,
+            open_result: None,
+            confirm_attempts: 0,
+            commit_attempted: false,
+            fence_error: None,
+            file_empty_baseline: false,
+            file_paste_succeeded: false,
+            failure_reason: reason.map(str::to_string),
+            failure_stage: None,
+        }
+    }
+
+    /// The real send plan's two reasons reach the run's error verbatim: this is
+    /// the mapping the stuck branch uses.
+    #[test]
+    fn a_stuck_send_reports_the_reason_its_plan_recorded() {
+        assert_eq!(
+            stuck_reason(&SendMessagePlan, &stopped(Some(SEND_FAIL_CHAT_NOT_OPEN))),
+            "chat_not_open"
+        );
+        assert_eq!(
+            stuck_reason(
+                &SendMessagePlan,
+                &stopped(Some(SEND_FAIL_CHAT_SELECTION_FAILED))
+            ),
+            "chat_selection_failed"
+        );
+    }
+
+    /// A plan that names no reason keeps the historical text, so nothing that
+    /// matched `"No action selected"` before still matches it.
+    #[test]
+    fn a_run_without_a_reason_keeps_the_historical_text() {
+        assert_eq!(
+            stuck_reason(&SendMessagePlan, &stopped(None)),
+            "No action selected"
+        );
+    }
+
+    /// A plan that never implemented the reason hook is unaffected: the default
+    /// keeps every other plan's error exactly as it was.
+    #[test]
+    fn a_plan_without_the_hook_still_reports_the_historical_text() {
+        struct PlainPlan;
+
+        #[async_trait::async_trait]
+        impl crate::plans::Plan for PlainPlan {
+            type PlanState = ();
+            type Params = ();
+
+            fn id(&self) -> &str {
+                "stuck_reason_test"
+            }
+
+            fn initial_plan_state(&self) {}
+
+            fn is_goal_reached(&self, _state: &AppState, _plan_state: &()) -> bool {
+                false
+            }
+
+            async fn select_action(
+                &self,
+                _state: &AppState,
+                _params: &(),
+                _identified: &IdentifiedStates,
+                _plan_state: &mut (),
+                _a11y: &A11yNode,
+                _session_id: &str,
+            ) -> Option<SelectedAction> {
+                None
+            }
+        }
+
+        assert_eq!(stuck_reason(&PlainPlan, &()), "No action selected");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// A plan that selects no action. It is only ever reached with a
+    /// pre-cancelled round, so the loop returns before it observes anything.
+    struct NeverPlan;
+
+    #[async_trait::async_trait]
+    impl crate::plans::Plan for NeverPlan {
+        type PlanState = ();
+        type Params = ();
+
+        fn id(&self) -> &str {
+            "guard_test"
+        }
+
+        fn initial_plan_state(&self) {}
+
+        fn is_goal_reached(&self, _state: &AppState, _plan_state: &()) -> bool {
+            false
+        }
+
+        async fn select_action(
+            &self,
+            _state: &AppState,
+            _params: &(),
+            _identified: &IdentifiedStates,
+            _plan_state: &mut (),
+            _a11y: &A11yNode,
+            _session_id: &str,
+        ) -> Option<SelectedAction> {
+            None
+        }
+    }
+
+    fn session() -> crate::ia::types::Session {
+        crate::ia::types::Session {
+            id: "guard-test".to_string(),
+            name: "default".to_string(),
+            linux_user: "wechat".to_string(),
+            display: ":99".to_string(),
+            dbus_address: None,
+            vnc_port: 5900,
+            status: "running".to_string(),
+            login_state: "logged_in".to_string(),
+            logged_in_user: None,
+            wechat_pid: None,
+            xvfb_pid: None,
+            dbus_pid: None,
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// The fenced entry point holds one guard across the identity fence, the
+    /// plan and the re-check. That only works if the loop body does not take the
+    /// same non-reentrant lock again: this test holds the guard and runs the
+    /// body directly, so re-acquiring it would hang until the timeout.
+    #[tokio::test]
+    async fn the_locked_loop_runs_under_an_already_held_guard() {
+        let guard = acquire_gui_guard().await;
+        let mut context = Context::new(session());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let noop = |_: SubscriptionEvent| {};
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_execution_loop_locked(&NeverPlan, &(), &mut context, &noop, cancel),
+        )
+        .await;
+
+        let (result, ()) = outcome.expect("the locked loop must not re-acquire the held guard");
+        assert!(!result.success);
+        drop(guard);
+    }
+
+    /// The old entry point still takes the guard itself, so callers that never
+    /// acquired one keep working unchanged.
+    #[tokio::test]
+    async fn the_entry_loop_takes_the_guard_itself() {
+        let mut context = Context::new(session());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let noop = |_: SubscriptionEvent| {};
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_execution_loop(&NeverPlan, &(), &mut context, &noop, cancel),
+        )
+        .await;
+
+        let (result, ()) = outcome.expect("the entry point must acquire the guard itself");
+        assert!(!result.success);
+    }
+}
+
+#[cfg(test)]
+mod log_privacy_tests {
+    use super::*;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// The message body a fenced send puts into `Action::Type`. It must never be
+    /// reachable from the execution log.
+    const SECRET: &str = "super-secret-message-body";
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run the production log statement for one selection and return what a
+    /// `debug`-level subscriber actually received.
+    fn captured(selected: Option<&SelectedAction>) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || log_selected_action(selected));
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn typed_send() -> SelectedAction {
+        SelectedAction {
+            action: crate::ia::actions::sequence(vec![
+                Action::Key {
+                    combo: "ctrl+a".to_string(),
+                },
+                Action::Type {
+                    text: SECRET.to_string(),
+                    selector: None,
+                },
+                Action::Wait { ms: 100 },
+                Action::Key {
+                    combo: "Return".to_string(),
+                },
+            ]),
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn the_logged_action_names_the_kind_but_never_the_message_body() {
+        let line = captured(Some(&typed_send()));
+        assert!(line.contains("sequence(4)"), "the kind is logged: {line}");
+        assert!(
+            !line.contains(SECRET),
+            "the message body must not reach the log: {line}"
+        );
+    }
+
+    #[test]
+    fn a_bare_typed_action_never_logs_its_text() {
+        let selected = SelectedAction {
+            action: Action::Type {
+                text: SECRET.to_string(),
+                selector: None,
+            },
+            frame: None,
+        };
+        let line = captured(Some(&selected));
+        assert!(line.contains("type_text"), "the kind is logged: {line}");
+        assert!(!line.contains(SECRET), "{line}");
+    }
+
+    #[test]
+    fn no_selected_action_logs_only_none() {
+        let line = captured(None);
+        assert!(line.contains("none"), "{line}");
+    }
 }

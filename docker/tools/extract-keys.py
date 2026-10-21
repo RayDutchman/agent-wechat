@@ -19,6 +19,7 @@ import time
 import struct
 import hashlib
 import hmac
+import contextlib
 
 # ── DB access pattern ─────────────
 CIPHER_CTX_PATTERN = bytes([
@@ -63,15 +64,30 @@ def find_active_account(pid):
     return None
 
 
-def find_databases(account_dir=None):
+def find_databases(account_dir=None, database_root=None):
     """Find all WeChat databases, optionally for a specific account."""
+    if database_root:
+        root = os.path.realpath(database_root)
+        if not account_dir or os.path.basename(os.path.dirname(root)) != account_dir or os.path.basename(root) != "db_storage" or not os.path.isdir(root):
+            return []
+        search = os.path.join(root, "**/*.db")
+        def belongs_to_root(path):
+            try:
+                return os.path.commonpath((root, os.path.realpath(path))) == root
+            except (OSError, ValueError):
+                return False
+        return sorted(f for f in glob.glob(search, recursive=True)
+                      if belongs_to_root(f) and os.path.isfile(f) and os.path.getsize(f) > 0)
     # Try both paths: direct ~/xwechat_files and ~/Documents/xwechat_files
     for candidate in ["~/xwechat_files", "~/Documents/xwechat_files"]:
         base = os.path.expanduser(candidate)
         if os.path.isdir(base):
             break
     if account_dir:
+        if account_dir in (".", "..") or os.path.basename(account_dir) != account_dir or "/" in account_dir or "\\" in account_dir:
+            return []
         search = os.path.join(base, account_dir, "db_storage/**/*.db")
+        return sorted(f for f in glob.glob(search, recursive=True) if os.path.getsize(f) > 0)
     else:
         search = os.path.join(base, "*/db_storage/**/*.db")
     dbs = sorted(f for f in glob.glob(search, recursive=True) if os.path.getsize(f) > 0)
@@ -194,32 +210,23 @@ def filter_candidates(keys, level=1):
     return list(dict.fromkeys(filtered))
 
 
-def test_key(db_path, key):
-    try:
-        sql = f"PRAGMA key = \"x'{key}'\";\nPRAGMA cipher_compatibility = 4;\nSELECT count(*) FROM sqlite_master;"
-        r = subprocess.run(
-            ["sqlcipher", db_path],
-            input=sql, capture_output=True, text=True, timeout=5
-        )
-        if r.returncode == 0:
-            lines = [l.strip() for l in r.stdout.strip().split('\n')
-                     if l.strip() and l.strip() != 'ok']
-            return lines[-1] if lines else "0"
-    except subprocess.TimeoutExpired:
-        pass
-    return None
-
-
 def matches_sqlcipher4_page(key, page):
-    """Pre-screen a raw credential using a 4096-byte SQLCipher 4 first page.
+    """Authenticate a raw credential using a 4096-byte SQLCipher 4 first page.
 
     The page has a 16-byte salt, a 16-byte IV, and a 64-byte SHA-512 HMAC.
-    A matching candidate still needs a successful schema query in test_key().
+    This establishes the key/page match, not whole-database integrity or schema
+    availability. Normal readers validate the schema on their private snapshots.
     """
-    if len(page) != 4096:
+    if len(page) != 4096 or not isinstance(key, str) or len(key) != 64:
+        return False
+    try:
+        raw_key = bytes.fromhex(key)
+    except ValueError:
+        return False
+    if len(raw_key) != 32:
         return False
     salt = bytes(value ^ 0x3a for value in page[:16])
-    hmac_key = hashlib.pbkdf2_hmac("sha512", bytes.fromhex(key), salt, 2, 32)
+    hmac_key = hashlib.pbkdf2_hmac("sha512", raw_key, salt, 2, 32)
     digest = hmac.new(hmac_key, page[16:4032] + struct.pack("<I", 1), "sha512").digest()
     return hmac.compare_digest(digest, page[4032:4096])
 
@@ -375,16 +382,33 @@ def extract_image_keys(pid, profile):
     """
     print("\nExtracting image access keys...")
     aes_key_hex = extract_image_aes_key(pid, profile)
-    print(f"  Image key: {aes_key_hex[:8]}...")
     return {"_image_aes": aes_key_hex}
 
 
-def main():
+def select_databases(account_dir, database_root=None):
+    """Return databases only for the process-bound account; no cross-account fallback."""
+    if not account_dir:
+        return []
+    return find_databases(account_dir, database_root)
+
+
+def emit_result(output, stream=None):
+    """Emit the machine protocol as one JSON document, without key-bearing logs."""
+    stream = stream or (sys.__stdout__ if "--stdout-json" in sys.argv else sys.stdout)
+    json.dump(output, stream, separators=(",", ":"))
+    stream.write("\n")
+
+
+def main(output_stream=None):
     parser = argparse.ArgumentParser(description="WeChat data access setup")
     parser.add_argument("--output", "-o", default=None,
                         help="Output JSON path (default: db_keys.json next to databases)")
     parser.add_argument("--pid", type=int, default=None,
                         help="WeChat PID (auto-detected if not specified)")
+    parser.add_argument("--stdout-json", action="store_true",
+                        help="Write only the result JSON to stdout; diagnostics go to stderr")
+    parser.add_argument("--database-root", default=None,
+                        help="Restrict search to the captured account db_storage root")
     args = parser.parse_args()
 
     pid = args.pid or find_wechat_pid()
@@ -397,10 +421,7 @@ def main():
     account_dir = find_active_account(pid)
     if account_dir:
         print(f"Active account: {account_dir}")
-    databases = find_databases(account_dir)
-    if not databases:
-        # Fallback: try all accounts
-        databases = find_databases()
+    databases = select_databases(account_dir, args.database_root)
     if not databases:
         print("ERROR: No WeChat databases found in ~/Documents/xwechat_files/")
         sys.exit(1)
@@ -439,22 +460,20 @@ def main():
             db_name = os.path.basename(db_path)
             found = False
             page = None
-            if profile.get("db_page_hmac"):
-                try:
-                    with open(db_path, "rb") as db_file:
-                        page = db_file.read(4096)
-                except OSError:
-                    pass
+            try:
+                with open(db_path, "rb") as db_file:
+                    page = db_file.read(4096)
+            except OSError:
+                still_remaining.append(db_path)
+                continue
             for key in new_candidates:
                 tests += 1
-                if page is not None and not matches_sqlcipher4_page(key, page):
+                if not matches_sqlcipher4_page(key, page):
                     continue
-                count = test_key(db_path, key)
-                if count is not None:
-                    results[db_name] = {"key": key, "tables": count, "path": db_path}
-                    print(f"  {db_name}: {key[:16]}... ({count} tables)")
-                    found = True
-                    break
+                results[db_name] = {"key": key, "path": db_path}
+                print(f"  {db_name}: credential verified")
+                found = True
+                break
             if not found:
                 still_remaining.append(db_path)
         remaining_dbs = still_remaining
@@ -482,11 +501,13 @@ def main():
             break
 
     output = {
-        "account": account,
+        "account": account_dir or account,
         "extracted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "note": "DB access keys",
         "keys": {name: info["key"] for name, info in sorted(results.items())},
     }
+    if args.database_root:
+        output["database_root"] = os.path.realpath(args.database_root)
 
     # Image access keys
     try:
@@ -495,9 +516,12 @@ def main():
     except Exception as e:
         print(f"  Image key setup failed: {e}")
 
-    with open(out_path, 'w') as f:
-        json.dump(output, f, indent=2)
-    print(f"Saved to: {out_path}")
+    if args.stdout_json:
+        emit_result(output, output_stream)
+    else:
+        with open(out_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        print(f"Saved to: {out_path}")
 
     not_found = [os.path.basename(db) for db in databases if os.path.basename(db) not in results]
     if not_found:
@@ -506,4 +530,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--stdout-json" in sys.argv:
+        machine_stdout = sys.stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            # Redirect diagnostics, then explicitly emit the JSON result to the
+            # original stdout descriptor from the result path below.
+            main(machine_stdout)
+    else:
+        main()

@@ -7,9 +7,16 @@ export type { Chat } from "./generated/Chat.js";
 export type { Contact } from "./generated/Contact.js";
 export type { Message } from "./generated/Message.js";
 export type { LoginSubscriptionEvent } from "./generated/LoginSubscriptionEvent.js";
-export type { SendParams } from "./generated/SendParams.js";
-export type { ImageData } from "./generated/ImageData.js";
-export type { FileData } from "./generated/FileData.js";
+export type { ContactKind } from "./generated/ContactKind.js";
+export type { ContactV2 } from "./generated/ContactV2.js";
+export type { GroupMemberV2 } from "./generated/GroupMemberV2.js";
+export type { ChatV2 } from "./generated/ChatV2.js";
+export type { ReadPageV2 } from "./generated/ReadPageV2.js";
+export type { MessageV2 } from "./generated/MessageV2.js";
+export type { ReferenceV2 } from "./generated/ReferenceV2.js";
+export type { ForwardedRecord } from "./generated/ForwardedRecord.js";
+export type { ForwardedRecordItem } from "./generated/ForwardedRecordItem.js";
+export type { XmlParseStatus } from "./generated/XmlParseStatus.js";
 export type { OpenChatResult } from "./generated/OpenChatResult.js";
 
 // ============================================
@@ -111,24 +118,6 @@ export interface OpenChatParams {
 // MESSAGES (params only — Message type is generated)
 // ============================================
 
-export interface ListMessagesParams {
-  chatId: string;
-  limit?: number;
-  offset?: number;
-}
-
-// Note: SendResult kept handwritten (has messageId field not yet in Rust)
-export interface SendResult {
-  success: boolean;
-  messageId?: string;
-  error?: string;
-}
-
-export interface GetMediaParams {
-  chatId: string;
-  localId: number;
-}
-
 // Note: MediaResult kept handwritten (Rust uses plain string for type,
 // TS has richer string literal union)
 export interface MediaResult {
@@ -149,7 +138,17 @@ export interface LoginEvent {
   state: LoginState;
 }
 
-export type ServerEvent = LoginEvent;
+export interface DataChangedEvent {
+  type: "data_changed";
+}
+
+export type ServerEvent = LoginEvent | DataChangedEvent;
+
+export type ChangeSubscriptionStatus =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "closed";
 
 // ============================================
 // AGENT CONFIGURATION

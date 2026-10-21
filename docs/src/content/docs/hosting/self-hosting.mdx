@@ -19,7 +19,7 @@ The simplest production setup is a VPS with Docker:
 
 ## Monitoring
 
-Check the container health:
+Check whether the container is running and whether the API reports server/login status (Compose does not define a Docker healthcheck):
 
 ```bash
 # Container status
@@ -30,7 +30,7 @@ wx status
 
 # Container logs
 wx logs
-# or
+# Or, from the directory containing the deployment configuration:
 docker compose logs -f agent-wechat
 ```
 
@@ -48,18 +48,16 @@ docker run --rm -v agent-wechat-data:/data -v $(pwd):/backup ubuntu tar czf /bac
 
 ## Updates
 
-To update to the latest image:
+The canonical Compose configuration never pulls images. Verify and make the desired immutable image available locally, update `AGENT_WECHAT_IMAGE` in the deployment environment, then recreate during a maintenance window:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose --env-file deployment.env config
+docker compose --env-file deployment.env up -d
 ```
 
-Or with the CLI:
+For CLI-managed deployments, use the CLI's documented update workflow instead:
 
 ```bash
-wx down
-docker pull ghcr.io/thisnick/agent-wechat:latest
 wx up
 ```
 

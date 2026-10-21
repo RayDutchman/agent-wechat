@@ -1,28 +1,46 @@
-# Sample docker-compose for standalone agent-wechat deployment.
-# Generate a token before starting:
-#   mkdir -p ~/.config/agent-wechat
-#   openssl rand -hex 32 > ~/.config/agent-wechat/token
-#   chmod 600 ~/.config/agent-wechat/token
+# Host-network Compose deployment. Supply a verified local image and existing
+# external volumes/token; see the deployment documentation before first use.
 
 services:
   agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
+    image: ${AGENT_WECHAT_IMAGE:?Set a verified local image ID or immutable digest}
+    pull_policy: never
     container_name: agent-wechat
+    hostname: ${AGENT_WECHAT_HOSTNAME:-agent-wechat}
+    network_mode: host
     security_opt:
       - seccomp=unconfined
     cap_add:
       - SYS_PTRACE
       - NET_ADMIN
-    ports:
-      - "6174:6174"
+    shm_size: 64m
     volumes:
       - agent-wechat-data:/data
       - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
+      - type: bind
+        source: ${AGENT_WECHAT_TOKEN_FILE:?Set the existing token file path}
+        target: /data/auth-token
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
-      - PROXY=${PROXY:-}
+      AGENT_HOST: "[::]"
+      AGENT_PORT: "6174"
+      AGENT_DB_PATH: /data/agent.db
+      DISPLAY: ":99"
+      WECHAT_SCREEN_WIDTH: ${WECHAT_SCREEN_WIDTH:-1280}
+      WECHAT_SCREEN_HEIGHT: ${WECHAT_SCREEN_HEIGHT:-800}
+      WECHAT_SCREEN_DEPTH: ${WECHAT_SCREEN_DEPTH:-24}
+      WECHAT_SCREEN_DPI: ${WECHAT_SCREEN_DPI:-100}
+      WECHAT_LOCALE: ${WECHAT_LOCALE:-C.UTF-8}
+      TZ: ${TZ:-UTC}
+      ENABLE_VNC: ${ENABLE_VNC:-1}
     restart: unless-stopped
 
 volumes:
   agent-wechat-data:
+    external: true
+    name: ${AGENT_WECHAT_DATA_VOLUME:-agent-wechat-data}
   agent-wechat-home:
+    external: true
+    name: ${AGENT_WECHAT_HOME_VOLUME:-agent-wechat-home}

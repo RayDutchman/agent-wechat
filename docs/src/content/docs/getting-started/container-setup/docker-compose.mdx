@@ -3,52 +3,43 @@ title: Docker Compose
 description: Run agent-wechat with Docker Compose for production or networked setups.
 ---
 
-Use Docker Compose when running agent-wechat alongside other services (like OpenClaw) or when you need more control over the configuration.
+Use `ghcr.io/raydutchman/agent-wechat:2026.10.21` for Linux AMD64. This image contains the verified server and WeChat 4.1.13.23. Pull it explicitly before starting Compose, which does not pull automatically. Source builds need a suitable WeChat `.deb`: the Dockerfile's mutable fallback does not guarantee this version.
 
-:::tip
-Don't want to manage Docker yourself? See [Managed Hosting](/hosting/managed-hosting) for a fully hosted option.
-:::
+```bash
+docker pull ghcr.io/raydutchman/agent-wechat:2026.10.21
+```
 
-## 1. Generate an auth token
+The repository root `docker-compose.yml` is the canonical host-network deployment. It requires a verified local image, existing external data/home volumes, and an existing token file. For a new standalone deployment, create those resources first; never regenerate the token when reusing existing account data.
+
+## 1. Prepare deployment settings
+
+```dotenv
+AGENT_WECHAT_IMAGE=ghcr.io/raydutchman/agent-wechat:2026.10.21
+AGENT_WECHAT_TOKEN_FILE=/absolute/path/to/token
+AGENT_WECHAT_DATA_VOLUME=agent-wechat-data
+AGENT_WECHAT_HOME_VOLUME=agent-wechat-home
+```
+
+For a genuinely new deployment only, create the token once with restrictive permissions and create the external Docker volumes before starting Compose. For an existing installation, use its original token path and volume names; never regenerate or overwrite its token.
 
 ```bash
 mkdir -p ~/.config/agent-wechat
 openssl rand -hex 32 > ~/.config/agent-wechat/token
 chmod 600 ~/.config/agent-wechat/token
+docker volume create agent-wechat-data
+docker volume create agent-wechat-home
 ```
 
-## 2. Create docker-compose.yml
+Keep `deployment.env` private and do not commit credentials or token contents.
 
-```yaml
-services:
-  agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
-    container_name: agent-wechat
-    security_opt:
-      - seccomp=unconfined
-    cap_add:
-      - SYS_PTRACE
-      - NET_ADMIN           # required only if using a proxy
-    ports:
-      - "6174:6174"
-    volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
-    environment:
-      - PROXY=${PROXY:-}    # optional: user:pass@host:port
-    restart: unless-stopped
-
-volumes:
-  agent-wechat-data:
-  agent-wechat-home:
-```
-
-## 3. Start the container
+## 2. Validate and start
 
 ```bash
-docker compose up -d
+docker compose --env-file deployment.env config
+docker compose --env-file deployment.env up -d
 ```
+
+Stop with `docker compose --env-file deployment.env stop`; this retains the container and volumes. The provided image supports interactive noVNC through the authenticated API proxy; builds using the source entrypoint retain its read-only default. Non-container clients connect to the Docker host's reachable address on port `6174`, not the service name.
 
 ## Key configuration
 
@@ -67,26 +58,11 @@ These are **not optional**. Without them, the server cannot control WeChat. See 
 | `agent-wechat-home` | `/home/wechat` | WeChat user data, databases, media files |
 | Token file | `/data/auth-token` | Read-only auth token mount |
 
-### Networking with OpenClaw
+### Networking with a custom client
 
-If running OpenClaw on the same Docker network, set the server URL to the container name:
+Host networking binds the API on `[::]:6174` and has no Compose port mapping. Non-container clients must connect using the Docker host's actual reachable address, such as `http://192.0.2.10:6174`, not the Docker service name. Provide the API token in authenticated requests.
 
-```json
-{
-  "channels": {
-    "wechat": {
-      "serverUrl": "http://agent-wechat:6174"
-    }
-  }
-}
-```
 
 ### Proxy
 
-Set the `PROXY` environment variable to route all container traffic through a proxy:
-
-```bash
-PROXY=user:pass@host:port docker compose up -d
-```
-
-Prefix with `socks5://` for SOCKS5 proxies.
+The canonical Compose file does not configure `PROXY`. Configure proxy routing through the supported `wx up --proxy ...` workflow or a separately reviewed deployment customization; `NET_ADMIN` is retained in Compose for compatibility with the container's networking requirements.

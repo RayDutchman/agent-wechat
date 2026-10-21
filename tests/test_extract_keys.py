@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import struct
 import shutil
@@ -83,7 +84,28 @@ class SqlcipherPageTests(unittest.TestCase):
             modified[80] ^= 1
             self.assertFalse(extract.matches_sqlcipher4_page(key, bytes(modified)))
             self.assertFalse(extract.matches_sqlcipher4_page(key, page[:100]))
-            self.assertEqual(extract.test_key(str(database), key), '1')
+            wal = Path(str(database) + '-wal')
+            shm = Path(str(database) + '-shm')
+            wal.write_bytes(b'untouched WAL fixture')
+            shm.write_bytes(b'untouched SHM fixture')
+            before = [p.read_bytes() for p in (database, wal, shm)]
+            with patch.object(extract.subprocess, 'run', side_effect=AssertionError('SQL/process validation forbidden')):
+                self.assertTrue(extract.matches_sqlcipher4_page(key, page))
+                self.assertFalse(extract.matches_sqlcipher4_page('00' * 32, page))
+                self.assertFalse(extract.matches_sqlcipher4_page('invalid', page))
+                self.assertFalse(extract.matches_sqlcipher4_page('00', page))
+                for profile in ({}, {'db_page_hmac': True}):
+                    output = Path(directory) / 'keys.json'
+                    with patch('sys.argv', ['extract-keys.py', '--pid', '4242', '--output', str(output)]), \
+                         patch.object(extract, 'find_active_account', return_value=directory), \
+                         patch.object(extract, 'select_databases', return_value=[str(database)]), \
+                         patch.object(extract, 'get_build_profile', return_value=profile), \
+                         patch.object(extract, 'extract_candidates', return_value=(1, [hashlib.sha256(b'wrong candidate').hexdigest(), key])), \
+                         patch.object(extract, 'extract_image_keys', return_value={}), \
+                         patch('builtins.print'):
+                        extract.main()
+                    self.assertEqual(json.loads(output.read_text())['keys'], {'fixture.db': key})
+            self.assertEqual(before, [p.read_bytes() for p in (database, wal, shm)])
 
 
 if __name__ == '__main__':

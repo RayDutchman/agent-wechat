@@ -77,7 +77,7 @@ class DownloadGuards(unittest.TestCase):
             with self.subTest(change=list(change)), self.assertRaises(ValueError):
                 worker.validate_metadata(self.fixture(**change))
 
-    def test_group_sender_is_separate_from_conversation(self):
+    def test_group_sender_is_separate_from_chat(self):
         result = worker.validate_metadata(self.fixture(chatId='123@chatroom'))
         self.assertEqual(result['senderId'], 'test-peer')
         self.assertEqual(result['chatId'], '123@chatroom')

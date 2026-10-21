@@ -8,9 +8,9 @@ description: Full reference for the wx command-line tool.
 | Command | Description |
 |---------|-------------|
 | `wx up [--proxy user:pass@host:port]` | Start the agent-wechat container (auto-pulls image) |
-| `wx down` | Stop and remove the container |
+| `wx down` | Stop and remove the container (or stop Compose services when configured locally); volumes are retained |
 | `wx logs` | Tail container logs |
-| `wx status` | Show container up/down status and login status |
+| `wx status [--json]` | Show container and login status |
 
 ## Auth
 
@@ -18,9 +18,8 @@ description: Full reference for the wx command-line tool.
 |---------|-------------|
 | `wx auth login` | Log in to WeChat (shows QR code in terminal) |
 | `wx auth logout` | Log out of WeChat |
-| `wx auth status` | Check login status |
-| `wx auth token` | Show current auth token |
-| `wx auth token --regenerate` | Generate a new auth token |
+| `wx auth status [--json]` | Check login status |
+| `wx auth token [--regenerate]` | Show or replace the local API token |
 
 Login options:
 - `--timeout <seconds>` — login timeout (default: 300)
@@ -30,12 +29,13 @@ Login options:
 
 | Command | Description |
 |---------|-------------|
-| `wx chats list` | List chats from WeChat |
+| `wx chats list` | List chats |
 | `wx chats get <chatId>` | Get details for a specific chat |
-| `wx chats find <name>` | Search chats by display name |
-| `wx chats open <chatId>` | Open a chat in the WeChat UI |
+| `wx chats find <name>` | Search chats by username or name |
+| `wx chats members <roomUsername>` | List group members |
+| `wx chats open <chatId> [--clear-unreads]` | Open a chat in the WeChat UI |
 
-Options: `--limit <n>`, `--offset <n>`, `--json`
+List/find/members support `--limit <n>`, `--cursor <cursor>`, `--all`, and `--json`. Chats list also supports `--query <text>`; list/find/members support `--expected-account-username <username>`. These are cursor-paged reads; there is no `--offset` option.
 
 ## Messages
 
@@ -43,12 +43,16 @@ Options: `--limit <n>`, `--offset <n>`, `--json`
 |---------|-------------|
 | `wx messages list <chatId>` | List messages in a chat |
 | `wx messages send <chatId>` | Send a message |
-| `wx messages media <chatId> <localId>` | Download a media attachment |
+| `wx messages media <chatId> <localId>` | Download media for the uniquely matched message |
+| `wx messages media <chatId> --server-id <id>` | Download media using the native message ID |
 
 Send options:
 - `--text "message"` — send text
 - `--image photo.jpg` — send an image
 - `--file document.pdf` — send a file
+- `--voice audio.wav` — send audio as one or more voice notes; supports `--detach`
+
+`wx messages list <chatId>` supports `--limit`, `--cursor`, `--order asc|desc`, `--config`, `--all`, and `--json`. `wx messages voice status <jobId>` and `wx messages voice cancel <jobId>` inspect or cancel voice jobs.
 
 Media options:
 - `--output <path>` — save to a specific file path
@@ -56,9 +60,15 @@ Media options:
 - `--full` — require the original-resolution image
 - `--thumbnail` — save the cached image preview
 
-The media command does not open a chat. For a regular phone photo, run
-`wx chats open <chatId>` first if you want WeChat to cache the standard-size
-copy; otherwise the default media command may save only the thumbnail.
+The media command does not open a chat. A positional `localId` is resolved against the chat's V2 message pages and must identify exactly one message with a nonzero native `server_id`; `--server-id` uses that native ID directly. Neither option is an offset or page index. Media may be pending or unavailable; opening the chat separately may cause WeChat to cache additional image variants.
+
+## Other commands
+
+| Command | Description |
+|---------|-------------|
+| `wx contacts list` / `wx contacts find <name>` | List or search contacts |
+| `wx events watch [--json]` | Watch broad data-change hints (not a message history) |
+| `wx session list/create/start/stop/delete` | Manage server sessions; see `wx session --help` for arguments |
 
 ## Debug
 

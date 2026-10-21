@@ -52,6 +52,7 @@ async fn main() {
     // Start background health monitor
     sessions::health_monitor::spawn_health_monitor();
     tracing::info!("WeChat health monitor started");
+    tools::wechat_keys::spawn_key_reconciler();
 
     // Build router
     let app = router::build_router();
@@ -64,7 +65,10 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    tools::wechat_events::change_monitor().shutdown().await;
+    tools::wechat_keys::shutdown_key_lifecycle().await;
     tools::media_download::shutdown().await;
+    tools::wechat_snapshot::clear_snapshot_cache();
 }
 
 async fn shutdown_signal() {
@@ -91,4 +95,6 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutting down...");
+    // Stop idle WebSocket handlers before Axum waits for graceful draining.
+    crate::tools::wechat_events::event_shutdown_token().cancel();
 }

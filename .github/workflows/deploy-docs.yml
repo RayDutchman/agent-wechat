@@ -1,11 +1,13 @@
 name: Deploy docs to GitHub Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docs/**'
   workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Branch to build and deploy
+        required: true
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_branch }}
 
       - uses: pnpm/action-setup@v4
 

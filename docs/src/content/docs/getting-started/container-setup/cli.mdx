@@ -3,26 +3,15 @@ title: Using the CLI (wx up)
 description: Start agent-wechat with a single command.
 ---
 
-The simplest way to run agent-wechat. The `wx up` command pulls the Docker image, creates the container with the correct flags, and starts it.
+Build this fork's CLI from source; the identically named npm package is published upstream and is not this fork's build. See the [quick start](/getting-started/quickstart). `wx up` may use a default image that does not contain this fork's server. Select a compatible image explicitly, for example through Docker Compose.
 
-:::tip
-Don't want to manage Docker yourself? See [Managed Hosting](/hosting/managed-hosting) for a fully hosted option.
-:::
+## Run CLI commands
 
-## Start the container
-
-```bash
-wx up
-```
-
-This starts a container named `agent-wechat` with:
-- **Port 6174** exposed — REST API + VNC web viewer at `/vnc/`
-- Persistent volumes for data and WeChat home directory
-- Auth token from `~/.config/agent-wechat/token` (auto-generated on first run)
+After building the CLI, run API commands as `node packages/cli/dist/cli.js <command> ...` against the running server. Use the [Compose deployment guide](/getting-started/container-setup/docker-compose) to pull `ghcr.io/raydutchman/agent-wechat:2026.10.21` and start the service. That image supports interactive noVNC; builds using the source entrypoint retain its read-only default.
 
 ## With a proxy
 
-To route all container traffic through a proxy:
+When using the CLI's container helper, proxy options are available:
 
 ```bash
 # HTTP proxy
@@ -37,19 +26,25 @@ This sets up a transparent proxy (redsocks + iptables) inside the container — 
 ## Stop the container
 
 ```bash
-wx down
+docker compose --env-file deployment.env stop
 ```
 
-This stops and removes the container. Your data persists in Docker volumes.
+Use Compose explicitly to stop the service when that is how it was started. This retains the container and volumes.
 
-## When to use this vs Docker Compose
+### Use an existing local Compose project
 
-Use `wx up` when:
-- Running locally for development or personal use
-- You don't need custom networking
-- You want the simplest possible setup
+To make `wx up` and `wx down` operate on a locally built image and an existing Compose project, create `~/.config/agent-wechat/container.json` with absolute paths:
 
-Use [Docker Compose](/getting-started/container-setup/docker-compose) when:
-- Running in production alongside other services (e.g., OpenClaw)
-- You need the container on a custom Docker network
-- You want more control over the configuration
+```json
+{
+  "project": "agent-wechat-environment",
+  "files": ["/absolute/path/to/compose.yml"],
+  "env_file": "/absolute/path/to/.env"
+}
+```
+
+With this file present, `wx up` runs `docker compose ... up -d`, and `wx down` runs `docker compose ... stop`. The config must be valid; it will not fall back to the default image if invalid. `--proxy` is not supported with this config; configure proxy settings in the Compose environment instead.
+
+## Image selection
+
+Choose an image compatible with this fork and your host architecture, or build it locally with the WeChat `.deb` you intend to run. The Dockerfile's mutable fallback does not pin a WeChat version. See [Docker Compose](/getting-started/container-setup/docker-compose) to select the image and persistent data explicitly.

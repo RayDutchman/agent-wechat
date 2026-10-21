@@ -4,7 +4,7 @@ import { remarkBasePath } from './remark-base-path.mjs';
 import { ogImage } from './og-image-integration.mjs';
 
 const base = '/agent-wechat';
-const site = 'https://thisnick.github.io';
+const site = 'https://RayDutchman.github.io';
 
 export default defineConfig({
   site,
@@ -22,7 +22,7 @@ export default defineConfig({
         Head: './src/components/Head.astro',
       },
       social: {
-        github: 'https://github.com/thisnick/agent-wechat',
+        github: 'https://github.com/RayDutchman/agent-wechat',
       },
       sidebar: [
         {
@@ -54,23 +54,9 @@ export default defineConfig({
           ],
         },
         {
-          label: 'OpenClaw Integration',
-          items: [
-            { label: 'Setup', slug: 'integrations/openclaw/setup' },
-            { label: 'Configuration', slug: 'integrations/openclaw/configuration' },
-            { label: 'Local Setup', slug: 'integrations/openclaw/local-setup' },
-            { label: 'Container Setup', slug: 'integrations/openclaw/container-setup' },
-          ],
-        },
-        {
-          label: 'Wechaty Integration',
-          items: [
-            { label: 'Puppet Setup', slug: 'integrations/wechaty/puppet-setup' },
-          ],
-        },
-        {
           label: 'Operations',
           items: [
+            { label: 'User Guide', slug: 'operations/user-guide' },
             { label: 'VNC Viewer', slug: 'operations/vnc' },
             { label: 'Tokens & Authentication', slug: 'operations/tokens' },
             { label: 'Data & Storage', slug: 'operations/data' },

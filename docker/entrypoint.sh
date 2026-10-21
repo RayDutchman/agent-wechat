@@ -9,6 +9,26 @@ export QT_ACCESSIBILITY=${QT_ACCESSIBILITY:-1}
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=${QT_LINUX_ACCESSIBILITY_ALWAYS_ON:-1}
 export GTK_MODULES=${GTK_MODULES:-gail:atk-bridge}
 export WECHAT_HOME=${WECHAT_HOME:-/home/wechat}
+WECHAT_SCREEN_WIDTH=${WECHAT_SCREEN_WIDTH:-1280}
+WECHAT_SCREEN_HEIGHT=${WECHAT_SCREEN_HEIGHT:-800}
+WECHAT_SCREEN_DEPTH=${WECHAT_SCREEN_DEPTH:-24}
+WECHAT_SCREEN_DPI=${WECHAT_SCREEN_DPI:-100}
+WECHAT_LOCALE=${WECHAT_LOCALE:-C.UTF-8}
+TZ=${TZ:-UTC}
+for value in "$WECHAT_SCREEN_WIDTH" "$WECHAT_SCREEN_HEIGHT" "$WECHAT_SCREEN_DPI"; do
+  [[ "$value" =~ ^[1-9][0-9]{0,9}$ ]] && (( 10#$value <= 4294967295 )) || { echo "Invalid positive display setting: $value" >&2; exit 1; }
+done
+case "$WECHAT_SCREEN_DEPTH" in 8|16|24) ;; *) echo "Invalid WECHAT_SCREEN_DEPTH: $WECHAT_SCREEN_DEPTH" >&2; exit 1 ;; esac
+[[ "$WECHAT_LOCALE" =~ ^[A-Za-z0-9_.@+-]+$ && "$TZ" =~ ^[A-Za-z0-9_./+-]+$ ]] || { echo "Invalid locale or TZ value" >&2; exit 1; }
+AVAILABLE_LOCALES=$(locale -a)
+if ! grep -Fxq -- "$WECHAT_LOCALE" <<< "$AVAILABLE_LOCALES"; then
+  if [[ "$WECHAT_LOCALE" == C.UTF-8 ]] && grep -Fxq 'C.utf8' <<< "$AVAILABLE_LOCALES"; then WECHAT_LOCALE=C.utf8
+  elif [[ "$WECHAT_LOCALE" == C.utf8 ]] && grep -Fxq 'C.UTF-8' <<< "$AVAILABLE_LOCALES"; then WECHAT_LOCALE=C.UTF-8
+  else echo "Unavailable WECHAT_LOCALE: $WECHAT_LOCALE" >&2; exit 1; fi
+fi
+[[ "$TZ" == UTC || ( "$TZ" != /* && "$TZ" != *//* && "$TZ" != . && "$TZ" != .. && "$TZ" != ./* && "$TZ" != ../* && "$TZ" != */./* && "$TZ" != */../* && "$TZ" != */. && "$TZ" != */.. && -f "/usr/share/zoneinfo/$TZ" ) ]] || { echo "Unavailable TZ: $TZ" >&2; exit 1; }
+export WECHAT_SCREEN_WIDTH WECHAT_SCREEN_HEIGHT WECHAT_SCREEN_DEPTH WECHAT_SCREEN_DPI WECHAT_LOCALE TZ
+export LANG="$WECHAT_LOCALE" LC_ALL="$WECHAT_LOCALE" LC_CTYPE="$WECHAT_LOCALE"
 
 # ============================================
 # X11 setup
@@ -111,7 +131,7 @@ fi
 # X11 shared-memory segments are owned by the GUI client. Run the X server
 # under the same user so Docker's restricted IPC capabilities do not prevent
 # it from attaching to WeChat's buffers (which leaves the UI visually stale).
-su -s /bin/bash -c "exec Xvfb '$DISPLAY' -screen 0 1280x800x24 -nolisten tcp" wechat &
+su -s /bin/bash -c "exec Xvfb '$DISPLAY' -screen 0 ${WECHAT_SCREEN_WIDTH}x${WECHAT_SCREEN_HEIGHT}x${WECHAT_SCREEN_DEPTH} -dpi '$WECHAT_SCREEN_DPI' -nolisten tcp" wechat &
 sleep 1
 
 # ============================================
@@ -152,7 +172,7 @@ fi
 if [ "${ENABLE_VNC:-1}" = "1" ]; then
   # -nopw: no VNC-level password (localhost only; auth enforced by agent-server proxy with full token)
   # -viewonly: no remote input
-  su -s /bin/bash -c "exec x11vnc -display '$DISPLAY' -forever -nopw -shared -viewonly -xkb -rfbport 5900 -listen 127.0.0.1" wechat &
+  su -s /bin/bash -c "exec x11vnc -display '$DISPLAY' -forever -nopw -shared -viewonly -xkb -rfbport 5900 -listen 127.0.0.1 -listenv6 ::1" wechat &
 fi
 
 # ============================================
@@ -169,6 +189,13 @@ fi
 # ============================================
 # Start PulseAudio (for audio support)
 # ============================================
+# /tmp lives in the container writable layer and therefore survives `docker start`.
+# A previous run leaves its runtime directory behind with a dead pid file and a
+# socket nobody listens on, so the next PulseAudio cannot start and the
+# readiness probe below times out. Drop the stale directory first, the same way
+# the stale X lock is cleared above.
+rm -rf /tmp/pulse-*
+
 if command -v pulseaudio >/dev/null 2>&1; then
   su -s /bin/bash -c "HOME=$WECHAT_HOME pulseaudio --start --exit-idle-time=-1" wechat || true
   if ! su -s /bin/bash -c "HOME=$WECHAT_HOME /opt/tools/voice-audio-ready" wechat; then

@@ -1,4 +1,4 @@
-use crate::ia::helpers::{extract_active_chat_id, find_frame_for};
+use crate::ia::helpers::{extract_active_chat_id, find_frame_for, has_valid_bounds};
 use crate::ia::selectors::query_selector;
 use crate::ia::types::*;
 use super::base::extract_window_control_bounds;
@@ -58,7 +58,19 @@ fn find_selected_chat_item(a11y: &A11yNode) -> Option<&A11yNode> {
         .find(|item| item.states.as_ref().map(|s| s.iter().any(|st| st == "SELECTED")).unwrap_or(false))
 }
 
-/// Chat state — no chat selected.
+/// Recognize the chat pane independently of the virtualized chat list.
+/// A selected row can be outside the accessibility tree, and a title is not a
+/// unique identity. Identity verification remains in chat selection/send fences;
+/// composer readiness is checked by the plan before input or commit.
+fn has_open_chat_pane(a11y: &A11yNode) -> bool {
+    let messages = query_selector(a11y, r#"list[name="Messages"]"#);
+    let send = query_selector(a11y, r#"push-button[name="Send"]"#)
+        .or_else(|| query_selector(a11y, r#"push-button[name="Send(S)"]"#));
+    messages.is_some_and(|node| has_valid_bounds(&node.bounds))
+        && send.is_some_and(|node| has_valid_bounds(&node.bounds))
+}
+
+/// Chat list view without an observable chat pane.
 struct ChatState;
 
 impl IAState for ChatState {
@@ -69,7 +81,7 @@ impl IAState for ChatState {
         if !is_chat_view(args.a11y) {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
-        if find_selected_chat_item(args.a11y).is_some() {
+        if has_open_chat_pane(args.a11y) {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
         Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"list[name="Chats"]"#) })
@@ -91,7 +103,7 @@ impl IAState for ChatState {
     }
 }
 
-/// Chat open state — a chat is selected and showing messages.
+/// Chat open state — the chat pane is visible, regardless of list scroll.
 struct ChatOpenState;
 
 impl IAState for ChatOpenState {
@@ -102,7 +114,7 @@ impl IAState for ChatOpenState {
         if !is_chat_view(args.a11y) {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
-        if find_selected_chat_item(args.a11y).is_none() {
+        if !has_open_chat_pane(args.a11y) {
             return Ok(IdentifyResult { identified: false, frame: None });
         }
         Ok(IdentifyResult { identified: true, frame: find_frame_for(args.a11y, r#"list[name="Chats"]"#) })
@@ -182,3 +194,76 @@ fn collect_labels<'a>(node: &'a A11yNode, out: &mut Vec<&'a A11yNode>) {
 pub static CHAT_STATES: std::sync::LazyLock<Vec<Box<dyn IAState>>> = std::sync::LazyLock::new(|| {
     vec![Box::new(ChatState), Box::new(ChatOpenState)]
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ia::identify_states;
+    use serde_json::{json, Value};
+
+    fn chat_tree(selected: bool, pane: Vec<Value>) -> A11yNode {
+        serde_json::from_value(json!({"role":"frame","name":"WeChat","children":[
+            {"role":"push-button","name":"Weixin"},
+            {"role":"push-button","name":"Contacts"},
+            {"role":"list","name":"Chats","children":[
+                {"role":"list-item","name":"Visible contact",
+                 "states":if selected { vec!["SELECTED"] } else { vec![] }}
+            ]},
+            {"role":"filler","name":"","children":pane}
+        ]})).unwrap()
+    }
+
+    fn messages() -> Value {
+        json!({"role":"list","name":"Messages",
+            "bounds":{"x":310.0,"y":80.0,"width":650.0,"height":500.0}})
+    }
+
+    fn send() -> Value {
+        // An empty composer normally has a disabled Send button. It still
+        // proves the pane is present; readiness to commit is checked later.
+        json!({"role":"push-button","name":"Send","states":["DISABLED"],
+            "bounds":{"x":890.0,"y":700.0,"width":55.0,"height":24.0}})
+    }
+
+    fn assert_state(tree: &A11yNode, expected: &str) {
+        let identified = identify_states(tree, "");
+        assert_eq!(identified.main_window.unwrap().state_id, expected);
+        let args = IdentifyArgs { a11y: tree, screenshot: "" };
+        assert_ne!(ChatState.identify(&args).unwrap().identified,
+                   ChatOpenState.identify(&args).unwrap().identified,
+                   "chat states must remain mutually exclusive");
+    }
+
+    #[test]
+    fn open_pane_without_selected_row_or_title_is_chat_open() {
+        assert_state(&chat_tree(false, vec![messages(), send()]), "chat_open");
+    }
+
+    #[test]
+    fn selected_row_alone_does_not_prove_an_open_pane() {
+        assert_state(&chat_tree(true, vec![]), "chat");
+    }
+
+    #[test]
+    fn incomplete_or_hidden_pane_is_not_open() {
+        for pane in [vec![], vec![messages()], vec![send()]] {
+            assert_state(&chat_tree(false, pane), "chat");
+        }
+        let mut hidden_send = send();
+        hidden_send["bounds"]["width"] = json!(0.0);
+        assert_state(&chat_tree(false, vec![messages(), hidden_send]), "chat");
+        let mut hidden_messages = messages();
+        hidden_messages["bounds"]["height"] = json!(0.0);
+        assert_state(&chat_tree(false, vec![hidden_messages, send()]), "chat");
+        let mut voice = send();
+        voice["name"] = json!("Send Voice");
+        assert_state(&chat_tree(false, vec![messages(), voice]), "chat");
+    }
+
+    #[test]
+    fn visible_selected_row_and_legacy_send_button_still_work() {
+        let mut button = send();
+        button["name"] = json!("Send(S)");
+        assert_state(&chat_tree(true, vec![messages(), button]), "chat_open");
+    }
+}

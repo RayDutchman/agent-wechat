@@ -35,4 +35,10 @@ pub trait Plan: Send + Sync {
         a11y: &A11yNode,
         session_id: &str,
     ) -> Option<SelectedAction>;
+
+    /// Get a stable, short failure reason if the plan ended with `None` (no action selected).
+    /// Must not leak PII, target/text/coords. Default empty to preserve compatibility.
+    fn get_failure_reason(&self, _plan_state: &Self::PlanState) -> Option<String> {
+        None
+    }
 }

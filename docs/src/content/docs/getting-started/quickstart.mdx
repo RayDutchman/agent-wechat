@@ -3,27 +3,31 @@ title: Quick Start
 description: Get agent-wechat running in under 5 minutes.
 ---
 
-The fastest way to get started is with the CLI. If you'd rather not manage infrastructure yourself, see [Managed Hosting](/hosting/managed-hosting).
+This repository is a fork; the identically named upstream npm package, upstream documentation, and upstream container images are not necessarily compatible with it. Build the CLI from this source and choose a compatible container image yourself, or build one locally with the WeChat `.deb` for the version you intend to use. The Dockerfile's mutable fallback does not guarantee a particular WeChat version; compatibility is architecture-sensitive.
 
 :::note[Prerequisites]
 You need **Docker** running on your machine. On macOS, install [Colima](https://github.com/abiosoft/colima) (`brew install colima && colima start`) or [Docker Desktop](https://www.docker.com/products/docker-desktop/). On Linux, install [Docker Engine](https://docs.docker.com/engine/install/).
 :::
 
-## 1. Install the CLI
+## 1. Build this fork's CLI
 
 ```bash
-npm install -g @agent-wechat/cli
+git clone --branch main https://github.com/RayDutchman/agent-wechat.git
+cd agent-wechat
+pnpm --filter cli... --filter shared... install --frozen-lockfile
+pnpm --filter @agent-wechat/shared build
+pnpm --filter @agent-wechat/cli build
+node packages/cli/dist/cli.js --help
+alias wx='node packages/cli/dist/cli.js'
 ```
 
-This installs the `wx` command globally.
+Use `node packages/cli/dist/cli.js <command> ...` or define the shown shell alias to run the locally built CLI; no global install or npm publication is needed.
 
-## 2. Start the container
+## 2. Prepare and start the container
 
-```bash
-wx up
-```
+Pull `ghcr.io/raydutchman/agent-wechat:2026.10.21` (Linux AMD64), then follow [Docker Compose setup](/getting-started/container-setup/docker-compose) to configure the image, persistent volumes, and token. The default `wx up` image may not contain this fork's server.
 
-This automatically pulls the Docker image from `ghcr.io/thisnick/agent-wechat` and starts the container with the correct flags, volume mounts, and auth token.
+When reusing account data, retain its existing token and volume names; do not replace the token. You can use the built CLI below for API interaction after the server is running.
 
 ## 3. Log in to WeChat
 
@@ -60,21 +64,15 @@ wx messages media <chatId> <messageId>
 
 ## 5. View the container via VNC
 
-Open your browser to `http://localhost:6174/vnc/` to see the WeChat desktop UI running inside the container. You'll be prompted for the auth token — find it with:
-
-```bash
-cat ~/.config/agent-wechat/token
-```
+Open your browser to `http://127.0.0.1:6174/vnc/` and enter the configured token. The provided image supports keyboard and mouse interaction; the source entrypoint retains its read-only default.
 
 ## 6. Stop the container
 
 ```bash
-wx down
+docker compose --env-file deployment.env stop
 ```
 
 ## Next steps
 
-- [OpenClaw integration](/integrations/openclaw/setup) — add WeChat as a channel in your OpenClaw AI agent
-- [Wechaty integration](/integrations/wechaty/puppet-setup) — connect existing Wechaty bots to WeChat
 - [CLI commands reference](/getting-started/cli/commands) — full list of everything the `wx` command can do
 - [Docker Compose setup](/getting-started/container-setup/docker-compose) — for production or networked deployments

@@ -26,6 +26,9 @@ docs/public/og/
 
 # Local data
 .data
+/backups/
+/tmp/
+/.superpowers/
 
 # Claude settings (local only)
 .claude
@@ -40,6 +43,12 @@ screenshot.png
 .env
 .env.local
 .envrc
+.env.*
+!.env.example
+
+# Local worktrees and developer state
+.worktrees/
+.local/
 
 # Downloaded WeChat data files
 wechat_files/

@@ -17,7 +17,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Database (SQLite + SQLCipher bundled)
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+# `hooks` is what exposes `Connection::progress_handler`, used to interrupt a
+# shard read that has outlived the collection's deadline.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "hooks"] }
 
 # Database migrations
 refinery = { version = "0.8", features = ["rusqlite"] }
@@ -43,6 +45,8 @@ base64 = "0.22"
 regex = "1"
 futures = "0.3"
 tokio-stream = "0.1"
+# Streaming XML reader for bounded message-record projection; DTD events are rejected.
+quick-xml = { version = "=0.42.0", default-features = false }
 
 # For WebSocket streaming
 async-stream = "0.3"

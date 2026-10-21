@@ -392,6 +392,86 @@ pub struct Contact {
     pub contact_type: String,
 }
 
+/// Versioned classification for source contact records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ContactKind {
+    Individual,
+    Group,
+    Enterprise,
+    Official,
+    System,
+    Unknown,
+}
+
+/// Contact fields retained from the isolated source database in the V2 contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ContactV2 {
+    pub username: String,
+    pub alias: String,
+    pub nick_name: String,
+    pub remark: String,
+    pub display_name: String,
+    pub kind: ContactKind,
+    #[ts(type = "number")]
+    pub local_type: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub official_type: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub verify_flag: Option<i64>,
+}
+
+/// A member identity and its names in one specific room context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct GroupMemberV2 {
+    pub room_username: String,
+    pub username: String,
+    pub group_nickname: String,
+    pub display_name: String,
+}
+
+/// Chat metadata with a stable source identity and a separate display label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ChatV2 {
+    pub username: String,
+    pub display_name: String,
+    pub remark: String,
+    pub nick_name: String,
+    #[ts(type = "number | null")]
+    pub unread_count: Option<i64>,
+    pub is_group: bool,
+    pub last_message_preview: Option<String>,
+    pub last_msg_sender: Option<String>,
+    pub last_sender_display_name: Option<String>,
+    pub last_activity_at: Option<String>,
+    #[ts(type = "number | null")]
+    pub last_msg_local_id: Option<i64>,
+}
+
+/// Versioned cursor page. All nullable fields are serialized explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ReadPageV2<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub release_token: Option<String>,
+}
+
 // ============================================
 // Message types (shared — generates TypeScript)
 // ============================================
@@ -435,6 +515,87 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub reply: Option<ReplyInfo>,
+}
+
+/// Lossless V2 projection of one stored message row. IDs and the packed source
+/// type cross JSON as decimal strings so JavaScript cannot round them.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub struct MessageV2 {
+    pub server_id: Option<String>,
+    pub local_id: Option<String>,
+    pub raw_type: String,
+    pub r#type: u32,
+    pub sub_type: u32,
+    pub chat_username: String,
+    pub sender_username: Option<String>,
+    pub sender_display_name: Option<String>,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub is_self: Option<bool>,
+    pub is_mentioned: Option<bool>,
+    /// Opaque source bytes retained by the existing frozen sample; consumers
+    /// must not treat this as decoded business content.
+    pub raw_content: Option<String>,
+    /// Whether `raw_content` contains source bytes stored with compression.
+    pub raw_content_compression: bool,
+    /// App-message subtype read independently from the source XML.
+    pub xml_sub_type: Option<u32>,
+    pub reference: Option<ReferenceV2>,
+    pub forwarded_record: Option<ForwardedRecord>,
+}
+
+/// A referenced message identity as recorded in that message, not inferred
+/// from the current outer-message sender or present-day contact directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ReferenceV2 {
+    pub server_id: Option<String>,
+    pub chat_username: Option<String>,
+    pub sender_username: Option<String>,
+    pub display_name: Option<String>,
+    pub content: String,
+}
+
+/// Result state for the bounded XML subset used to project forwarded records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub enum XmlParseStatus {
+    Complete,
+    Truncated,
+    Invalid,
+}
+
+/// One ordered source entry from an app-message forwarded record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ForwardedRecordItem {
+    pub datatype: Option<u32>,
+    pub dataid: Option<String>,
+    pub datadesc: Option<String>,
+    pub sourcename: Option<String>,
+    pub sourceheadurl: Option<String>,
+    pub sourcetime: Option<String>,
+    pub src_msg_create_time: Option<String>,
+    pub from_new_msg_id: Option<String>,
+    pub dataitem_source_hash_username: Option<String>,
+}
+
+/// A bounded projection of a forwarded chat record; not an executable inbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ForwardedRecord {
+    pub parse_status: XmlParseStatus,
+    pub items: Vec<ForwardedRecordItem>,
 }
 
 // ============================================
@@ -499,50 +660,6 @@ pub enum LoginSubscriptionEvent {
     LoginTimeout,
     #[serde(rename = "error")]
     Error { message: String },
-}
-
-// ============================================
-// Send types (shared — generates TypeScript)
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct SendParams {
-    pub chat_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub image: Option<ImageData>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub file: Option<FileData>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub struct ImageData {
-    pub data: String,
-    pub mime_type: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct FileData {
-    pub data: String,
-    pub filename: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct SendResult {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

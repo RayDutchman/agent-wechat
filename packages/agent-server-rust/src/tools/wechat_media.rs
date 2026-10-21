@@ -104,7 +104,15 @@ pub fn download_metadata(account: &str, keys: &HashMap<String, String>, chat: &s
     if id <= 0 || id > u32::MAX as i64 ||
         (!native_user_id(chat) && !native_group_id(chat)) { return None; }
     let (name, key) = find_message_db(account, keys, chat)?;
-    let path = get_db_path(account, &name);
+    download_metadata_from_shard(account, &name, key, chat, id)
+}
+
+/// Build native transfer metadata from the exact message shard already resolved
+/// by the server-id locator. This avoids repeating the legacy first-shard lookup.
+pub fn download_metadata_from_shard(account: &str, shard: &str, key: &str, chat: &str, id: i64) -> Option<serde_json::Value> {
+    if id <= 0 || id > u32::MAX as i64 || !crate::tools::wechat_messages::is_message_db(shard) ||
+        (!native_user_id(chat) && !native_group_id(chat)) { return None; }
+    let path = get_db_path(account, shard);
     let table = get_msg_table_name(chat);
     let rows = query_wechat_db(&path, &key, &format!(
         "SELECT m.local_id, m.local_type, CAST(m.server_id AS TEXT) AS server_id,
@@ -145,6 +153,43 @@ pub fn download_metadata(account: &str, keys: &HashMap<String, String>, chat: &s
         "accountId": matches[0], "chatId": chat, "senderId": sender, "local_id": id, "local_type": kind,
         "server_id": row.get("server_id")?.as_str()?, "sort_seq": row.get("sort_seq")?.as_str()?,
         "create_time": row.get("create_time")?.as_i64()?, "content": content,
+    }))
+}
+
+/// Construct the same native transfer metadata from a previously verified
+/// message anchor instead of running the legacy first-shard SQL lookup again.
+pub fn download_metadata_from_anchor(
+    account_id: &str,
+    chat: &str,
+    sender: Option<&str>,
+    local_id: i64,
+    local_type: i64,
+    server_id: i64,
+    sort_seq: Option<&str>,
+    create_time: i64,
+    content: &str,
+) -> Option<serde_json::Value> {
+    if local_id <= 0 || local_id > u32::MAX as i64 || server_id == 0
+        || (!native_user_id(chat) && !native_group_id(chat))
+    { return None; }
+    let sender = sender.filter(|value| !value.is_empty())?;
+    if local_type != 3 && local_type != 43 && local_type != (6i64 << 32 | 49) { return None; }
+    if content.is_empty() || content.len() > 1024 * 1024 || content.contains('\0') { return None; }
+    if local_type == (6i64 << 32 | 49) {
+        if !safe_attachment_name(&extract_xml_tag(content, "title")?) { return None; }
+        extract_xml_tag(content, "totallen")?.parse::<u64>().ok()?;
+        let hash = extract_xml_tag(content, "md5")?;
+        if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    } else if local_type == 43 {
+        video_attr(content, "length")?.parse::<u64>().ok()?;
+        let hash = video_attr(content, "md5")?;
+        if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    }
+    let content = native_message_body(chat, sender, account_id, content.to_string())?;
+    Some(serde_json::json!({
+        "accountId": account_id, "chatId": chat, "senderId": sender, "local_id": local_id,
+        "local_type": local_type, "server_id": server_id.to_string(),
+        "sort_seq": sort_seq?, "create_time": create_time, "content": content,
     }))
 }
 
@@ -198,6 +243,20 @@ fn lookup_message_raw(
     };
 
     Some((local_type, create_time, body))
+}
+
+/// Decode an exact message source for the legacy media/cache policy. Unlike the
+/// frozen V2 sample this has no 4 MiB display-read cap: cached-file/image lookup
+/// can depend on XML attributes. Native transfer metadata still applies its
+/// existing one-MiB validation independently.
+pub fn decode_media_message_content(hex_content: &str, is_compressed: bool) -> String {
+    let content = decode_message_content(hex_content, is_compressed);
+    if let Some(index) = content.find(":\n") {
+        if index < 80 {
+            return content[index + 2..].to_string();
+        }
+    }
+    content
 }
 
 /// Extract an XML attribute value.
@@ -833,44 +892,17 @@ fn decrypt_and_return(
 ) -> MediaResult {
     let dat = match fs::read(dat_path) {
         Ok(d) => d,
-        Err(_) => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                quality: None,
-            }
-        }
+        Err(_) => return pending(),
     };
 
     let xor_byte = match resolve_xor_byte(dat_path, &dat, image_keys) {
         Some(xb) => xb,
-        None => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                quality: None,
-            }
-        }
+        None => return pending(),
     };
 
     let decrypted = match decrypt_dat(&dat, &image_keys.aes_key_hex, xor_byte) {
         Some(d) => d,
-        None => {
-            return MediaResult {
-                media_type: "image".into(),
-                data: None,
-                url: None,
-                format: "jpeg".into(),
-                filename: format!("msg_{local_id}.jpg"),
-                quality: None,
-            }
-        }
+        None => return pending(),
     };
 
     let (format, ext) = detect_image_format(&decrypted);
@@ -1071,6 +1103,15 @@ fn get_file_attachment(
     create_time: i64,
     local_id: i64,
 ) -> MediaResult {
+    get_file_attachment_from_bases(&account_base_paths(account_dir), content, create_time, local_id)
+}
+
+fn get_file_attachment_from_bases(
+    bases: &[String],
+    content: &str,
+    create_time: i64,
+    local_id: i64,
+) -> MediaResult {
     let filename = extract_xml_tag(content, "title").unwrap_or_else(|| format!("file_{local_id}"));
     let ext = extract_xml_tag(content, "fileext").unwrap_or_default();
     // The title comes from another client, not a trusted filesystem path.
@@ -1082,7 +1123,7 @@ fn get_file_attachment(
     let dt = chrono::DateTime::from_timestamp(create_time, 0);
     let year_month = dt.map(|d| d.format("%Y-%m").to_string()).unwrap_or_default();
 
-    for base in &account_base_paths(account_dir) {
+    for base in bases {
         let file_path = Path::new(base)
             .join("msg/file")
             .join(&year_month)
@@ -1181,14 +1222,7 @@ fn get_image_for_quality(
         tracing::warn!("[media] no image keys available for local_id={}", local_id);
     }
 
-    MediaResult {
-        media_type: "image".into(),
-        data: None,
-        url: None,
-        format: "jpeg".into(),
-        filename: format!("msg_{local_id}.jpg"),
-        quality: None,
-    }
+    pending()
 }
 
 /// Get media attachment for a message.
@@ -1212,6 +1246,41 @@ pub fn get_message_media(
             }
         };
 
+    get_message_media_from_anchor(account_dir, keys, chat_id, local_id, local_type, create_time, content, image_keys_raw, quality)
+}
+
+/// Apply the existing media/cache policy to content and source coordinates
+/// already verified by an exact server-id lookup; this never reselects a shard.
+pub fn get_message_media_from_anchor(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    local_type: i64,
+    create_time: i64,
+    content: String,
+    image_keys_raw: Option<(String, Option<u8>)>,
+    quality: ImageQuality,
+) -> MediaResult {
+    get_message_media_from_anchor_with_bases(
+        account_dir, keys, chat_id, local_id, local_type, create_time, content,
+        image_keys_raw, quality, &account_base_paths(account_dir),
+    )
+}
+
+fn get_message_media_from_anchor_with_bases(
+    account_dir: &str,
+    keys: &HashMap<String, String>,
+    chat_id: &str,
+    local_id: i64,
+    local_type: i64,
+    create_time: i64,
+    content: String,
+    image_keys_raw: Option<(String, Option<u8>)>,
+    quality: ImageQuality,
+    account_bases: &[String],
+) -> MediaResult {
+
     let base = (local_type & 0xFFFFFFFF) as i32;
     let sub = (local_type >> 32) as i32;
     let non_image_quality = non_image_quality(quality);
@@ -1219,7 +1288,7 @@ pub fn get_message_media(
     match base {
         49 if sub == 6 => {
             // File attachment (appmsg subtype 6)
-            return get_file_attachment(account_dir, &content, create_time, local_id);
+            return get_file_attachment_from_bases(account_bases, &content, create_time, local_id);
         }
         3 => {
             tracing::info!(
@@ -1278,6 +1347,109 @@ pub fn get_message_media(
 #[cfg(test)]
 mod quality_tests {
     use super::*;
+
+    #[test]
+    fn native_metadata_uses_exact_anchored_message_values() {
+        let xml = "<msg><appmsg><title>archive.zip</title><totallen>4</totallen><md5>0123456789abcdef0123456789abcdef</md5></appmsg></msg>";
+        let metadata = download_metadata_from_anchor(
+            "wxid_me", "wxid_peer", Some("wxid_peer"), 7,
+            (6_i64 << 32) | 49, 9_168_265_261_376_983_777, Some("44"), 123, xml,
+        ).unwrap();
+        assert_eq!(metadata["server_id"], "9168265261376983777");
+        assert_eq!(metadata["local_id"], 7);
+        assert_eq!(metadata["create_time"], 123);
+        assert_eq!(metadata["content"], xml);
+        let over_native_metadata_limit = format!("{xml}{}", "x".repeat(1024 * 1024));
+        assert!(download_metadata_from_anchor(
+            "wxid_me", "wxid_peer", Some("wxid_peer"), 7,
+            (6_i64 << 32) | 49, 99, Some("44"), 123, &over_native_metadata_limit,
+        ).is_none());
+        assert!(download_metadata_from_anchor(
+            "wxid_me", "wxid_peer", Some("another_sender"), 7,
+            (6_i64 << 32) | 49, 99, Some("44"), 123, xml,
+        ).is_none());
+    }
+
+    #[test]
+    fn anchored_file_media_matches_legacy_cache_read_and_missing_cache_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().to_string();
+        let roots = vec![base.clone()];
+        let content = b"cached attachment";
+        let xml = format!(
+            "<msg><appmsg><title>report.txt</title><fileext>txt</fileext><totallen>{}</totallen><md5>{:x}</md5></appmsg></msg>",
+            content.len(), Md5::digest(content),
+        );
+        let cached_path = Path::new(&base).join("msg/file/2024-01/report.txt");
+        fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
+        fs::write(&cached_path, content).unwrap();
+
+        let legacy_media = get_file_attachment_from_bases(&roots, &xml, 1_704_067_200, 7);
+        let anchored_media = get_message_media_from_anchor_with_bases(
+            &base, &HashMap::new(), "wxid_peer", 7, (6_i64 << 32) | 49,
+            1_704_067_200, xml.clone(), None, ImageQuality::Best, &roots,
+        );
+        assert_eq!(anchored_media.media_type, legacy_media.media_type);
+        assert_eq!(anchored_media.data, legacy_media.data);
+        assert_eq!(anchored_media.filename, legacy_media.filename);
+        assert_eq!(anchored_media.data.as_deref(), Some("Y2FjaGVkIGF0dGFjaG1lbnQ="));
+
+        let bounded_sample_placeholder = "[compressed content - exceeds the read budget]";
+        let bounded_anchor_media = get_message_media_from_anchor_with_bases(
+            &base, &HashMap::new(), "wxid_peer", 7, (6_i64 << 32) | 49,
+            1_704_067_200, bounded_sample_placeholder.into(), None, ImageQuality::Best, &roots,
+        );
+        assert_eq!(bounded_anchor_media.media_type, "pending");
+        assert!(bounded_anchor_media.data.is_none());
+
+        fs::remove_file(cached_path).unwrap();
+        let missing_media = get_message_media_from_anchor_with_bases(
+            &base, &HashMap::new(), "wxid_peer", 7, (6_i64 << 32) | 49,
+            1_704_067_200, xml, None, ImageQuality::Best, &roots,
+        );
+        assert_eq!(missing_media.media_type, "pending");
+        assert!(missing_media.data.is_none());
+    }
+
+    #[test]
+    fn media_content_decode_retains_xml_above_the_v2_sample_budget() {
+        let xml = "<msg><appmsg><title>report.txt</title><totallen>18</totallen><md5>0123456789abcdef0123456789abcdef</md5></appmsg></msg>";
+        let hex = zstd::encode_all(xml.as_bytes(), 3).unwrap().iter()
+            .map(|byte| format!("{byte:02X}")).collect::<String>();
+        assert_eq!(decode_media_message_content(&hex, true), xml);
+        assert_eq!(decode_media_message_content("6162633a0a3c6d73672f3e", false), "<msg/>");
+    }
+
+    #[test]
+    fn missing_requested_image_returns_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = HashMap::new();
+        let image_keys = ("00".repeat(16), Some(0));
+        for quality in [ImageQuality::Standard, ImageQuality::Full] {
+            for credentials in [None, Some(&image_keys)] {
+                let result = get_image_for_quality(
+                    dir.path().to_str().unwrap(), &keys, "test-chat", 1, 0,
+                    "<img />", credentials, quality,
+                );
+                assert_eq!(result.media_type, "pending");
+                assert!(result.data.is_none() && result.url.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_or_undecryptable_image_returns_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.dat");
+        let invalid = dir.path().join("invalid.dat");
+        fs::write(&invalid, b"invalid image cache").unwrap();
+        for (path, xor_byte) in [(&missing, Some(0)), (&invalid, None), (&invalid, Some(0))] {
+            let keys = ImageKeys { aes_key_hex: "00".repeat(16), xor_byte };
+            let result = decrypt_and_return(path.to_str().unwrap(), &keys, 1);
+            assert_eq!(result.media_type, "pending");
+            assert!(result.data.is_none() && result.url.is_none());
+        }
+    }
 
     #[test]
     fn native_group_body_preserves_sender_identity() {

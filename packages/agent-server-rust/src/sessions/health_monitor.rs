@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{path::PathBuf, sync::atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 
 use crate::ia::identify_states;
@@ -6,13 +6,13 @@ use crate::sessions::manager::get_session;
 use crate::tools::a11y::get_a11y_desktop;
 use crate::tools::exec::ExecOptions;
 use crate::tools::screenshot::capture_screenshot;
-use crate::tools::wechat_db::find_wechat_pid;
+use crate::tools::wechat_db::{find_account_dir, find_wechat_pid};
 
 /// How often to run the health scan (in seconds).
 const SCAN_INTERVAL_SECS: u64 = 1;
 
 /// Kill WeChat if no IA state has been identified for this long (in seconds).
-const UNRESPONSIVE_TIMEOUT_SECS: u64 = 60;
+const UNRESPONSIVE_TIMEOUT_SECS: u64 = 120;
 
 /// Delay before restarting WeChat after a crash (in seconds).
 const RESTART_DELAY_SECS: u64 = 3;
@@ -56,7 +56,7 @@ fn spawn_wechat(session: &crate::ia::types::Session) {
 ///
 /// Every second, it checks the default session's WeChat process by running
 /// a11y → identify. If WeChat has crashed, it restarts it. If no IA state
-/// has been identified for more than 60 seconds, it kills and restarts it.
+/// has been identified for more than 120 seconds, it kills and restarts it.
 pub fn spawn_health_monitor() {
     tokio::spawn(async move {
         tracing::info!("[health] WeChat health monitor started");
@@ -80,6 +80,7 @@ pub fn spawn_health_monitor() {
             let session = match get_session("default") {
                 Some(s) if s.status == "running" => s,
                 _ => {
+                    crate::tools::wechat_events::change_monitor().set_source(None).await;
                     last_identified = Instant::now();
                     continue;
                 }
@@ -88,6 +89,8 @@ pub fn spawn_health_monitor() {
             // Check if WeChat process is even running
             let wechat_pid = match find_wechat_pid() {
                 Some(pid) => {
+                    let source = find_account_dir(pid).and_then(message_data_root);
+                    crate::tools::wechat_events::change_monitor().set_source(source).await;
                     if !was_running {
                         tracing::info!("[health] WeChat process found (pid={})", pid);
                         was_running = true;
@@ -96,6 +99,7 @@ pub fn spawn_health_monitor() {
                     pid
                 }
                 None => {
+                    crate::tools::wechat_events::change_monitor().set_source(None).await;
                     if was_running {
                         tracing::warn!(
                             "[health] WeChat process disappeared (likely crashed), restarting"
@@ -165,6 +169,16 @@ pub fn spawn_health_monitor() {
             }
         }
     });
+}
+
+/// Resolve only the already-discovered account to its message data root.
+/// This observes the same process/account metadata used by the read handlers;
+/// it does not probe SQLite or expose the path through the event API.
+fn message_data_root(account: String) -> Option<PathBuf> {
+    ["/home/wechat/xwechat_files", "/home/wechat/Documents/xwechat_files"]
+        .iter()
+        .map(|root| PathBuf::from(root).join(&account).join("db_storage"))
+        .find(|path| path.is_dir())
 }
 
 /// If time since last identified state exceeds the timeout, kill the WeChat process.

@@ -10,7 +10,19 @@ set -euo pipefail
 WECHAT_HOME="${WECHAT_HOME:-/home/wechat}"
 WECHAT_USER="${WECHAT_USER:-wechat}"
 
+WECHAT_LOCALE="${WECHAT_LOCALE:-C.UTF-8}"
+TZ="${TZ:-UTC}"
+[[ "$WECHAT_LOCALE" =~ ^[A-Za-z0-9_.@+-]+$ && "$TZ" =~ ^[A-Za-z0-9_./+-]+$ ]] || { echo "Invalid locale or TZ value" >&2; exit 1; }
+AVAILABLE_LOCALES=$(locale -a)
+if ! grep -Fxq -- "$WECHAT_LOCALE" <<< "$AVAILABLE_LOCALES"; then
+  if [[ "$WECHAT_LOCALE" == C.UTF-8 ]] && grep -Fxq 'C.utf8' <<< "$AVAILABLE_LOCALES"; then WECHAT_LOCALE=C.utf8
+  elif [[ "$WECHAT_LOCALE" == C.utf8 ]] && grep -Fxq 'C.UTF-8' <<< "$AVAILABLE_LOCALES"; then WECHAT_LOCALE=C.UTF-8
+  else echo "Unavailable WECHAT_LOCALE: $WECHAT_LOCALE" >&2; exit 1; fi
+fi
+[[ "$TZ" == UTC || ( "$TZ" != /* && "$TZ" != *//* && "$TZ" != . && "$TZ" != .. && "$TZ" != ./* && "$TZ" != ../* && "$TZ" != */./* && "$TZ" != */../* && "$TZ" != */. && "$TZ" != */.. && -f "/usr/share/zoneinfo/$TZ" ) ]] || { echo "Unavailable TZ: $TZ" >&2; exit 1; }
+export LANG="$WECHAT_LOCALE" LC_ALL="$WECHAT_LOCALE" LC_CTYPE="$WECHAT_LOCALE" TZ
 exec su -s /bin/bash -c "DISPLAY=$DISPLAY \
+  LANG='$WECHAT_LOCALE' LC_ALL='$WECHAT_LOCALE' LC_CTYPE='$WECHAT_LOCALE' TZ='$TZ' \
   DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-} \
   QT_ACCESSIBILITY=1 \
   QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \

@@ -3,7 +3,8 @@ pub mod queries;
 use refinery::embed_migrations;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 embed_migrations!("migrations");
 
@@ -132,6 +133,64 @@ pub fn get_db() -> std::sync::MutexGuard<'static, Connection> {
         .expect("Database mutex poisoned")
 }
 
+/// Why a lock was not handed out.
+///
+/// The two are kept apart because they are not the same failure: a wait that ran
+/// out says this caller was too slow, while a poisoned lock says a previous
+/// holder panicked part way through, so whatever it was doing is not known to
+/// have finished. A read that is answering from that state would be answering
+/// from an unverified one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockError {
+    /// A holder panicked while holding this lock.
+    Poisoned,
+    /// Nobody was holding it within the budget.
+    WaitExpired,
+}
+
+/// Take a mutex within `budget`, or say why it could not be taken.
+///
+/// [`get_db`] and `Mutex::lock` wait for as long as the holder keeps the lock,
+/// and a caller that is itself under a deadline has no way to give the turn back
+/// while it waits. This is the same lock, waited for at most `budget`: the
+/// holder is a thread doing database work, not a resource this crate can cancel,
+/// so the honest answer at the deadline is to report that the lock was not
+/// available rather than to keep the caller waiting.
+///
+/// A poisoned lock is refused, not handed out. The data behind it may well be
+/// fine, but this function cannot show that it is, and reusing it silently would
+/// turn one panicking writer into every later reader's problem.
+pub(crate) fn lock_within<T>(mutex: &Mutex<T>, budget: Duration) -> Result<MutexGuard<'_, T>, LockError> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => return Err(LockError::Poisoned),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(LockError::WaitExpired);
+        }
+        // Short enough to notice the deadline within a millisecond or so of it,
+        // long enough not to spin a core while somebody finishes a statement.
+        std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// The shared connection, taken within `budget`.
+///
+/// The same connection [`get_db`] hands out, with a deadline attached, for the
+/// callers that are answering a request under one. Not initialised is still a
+/// panic, exactly as in `get_db`: that is a start-up ordering bug, not a
+/// condition a read can report.
+pub(crate) fn try_get_db(budget: Duration) -> Result<MutexGuard<'static, Connection>, LockError> {
+    lock_within(
+        DB.get().expect("Database not initialized. Call init_db() first."),
+        budget,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +248,73 @@ mod tests {
         let plain = Connection::open(path_str).unwrap();
         let result = plain.execute_batch("SELECT count(*) FROM sqlite_master;");
         assert!(result.is_err(), "Plain open should fail after migration");
+    }
+
+    #[test]
+    fn a_lock_that_outlives_the_budget_is_reported_instead_of_waited_for() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mutex = std::sync::Arc::new(Mutex::new(7usize));
+        let held_by_other = mutex.clone();
+        let (is_holding, may_look) = mpsc::channel::<()>();
+        // Somebody else holds the connection for longer than any round lasts.
+        let other = std::thread::spawn(move || {
+            let _held = held_by_other.lock().unwrap();
+            is_holding.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        may_look.recv().unwrap();
+
+        let started = Instant::now();
+        let outcome = lock_within(&mutex, Duration::from_millis(60));
+        let waited = started.elapsed();
+
+        assert_eq!(
+            outcome.unwrap_err(),
+            LockError::WaitExpired,
+            "a lock nobody can see must not be waited out past the round"
+        );
+        assert!(waited < Duration::from_millis(300), "waited {waited:?}");
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn a_free_lock_is_taken_at_once() {
+        use std::time::{Duration, Instant};
+
+        let mutex = Mutex::new(7usize);
+        let started = Instant::now();
+        assert_eq!(*lock_within(&mutex, Duration::from_millis(60)).expect("free"), 7);
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "an uncontended lock must not wait at all"
+        );
+    }
+
+    #[test]
+    fn a_lock_left_poisoned_by_a_panicking_holder_is_refused_rather_than_handed_out() {
+        use std::time::Duration;
+
+        let mutex = std::sync::Arc::new(Mutex::new(7usize));
+        let panicking = mutex.clone();
+        // The only guard is taken inside the panicking thread and dropped by the
+        // unwinding, which is what poisons the lock.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = panicking.lock().unwrap();
+            panic!("a writer panicked while holding the connection");
+        }));
+        assert!(outcome.is_err(), "the panic is what poisons the lock");
+
+        // The guard is gone, so nothing is holding the lock any more: this
+        // refusal is about unverified state, not about a lock nobody can take.
+        assert_eq!(
+            lock_within(&mutex, Duration::from_millis(60)).unwrap_err(),
+            LockError::Poisoned
+        );
+        // Which is recoverable on purpose, by an operator rather than by a read:
+        // the data behind the lock is still there to be inspected.
+        assert_eq!(*mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), 7);
     }
 
     #[test]

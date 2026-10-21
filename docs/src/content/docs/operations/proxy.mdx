@@ -17,20 +17,7 @@ wx up --proxy user:pass@host:port
 wx up --proxy socks5://user:pass@host:port
 ```
 
-### Via Docker Compose
-
-Set the `PROXY` environment variable:
-
-```yaml
-environment:
-  - PROXY=user:pass@host:port
-```
-
-Or pass it on the command line:
-
-```bash
-PROXY=user:pass@host:port docker compose up -d
-```
+Use the CLI workflow above to configure proxy routing. The canonical Compose file does not expose a `PROXY` setting; adding one requires a separately reviewed deployment customization.
 
 ## How it works
 
@@ -61,9 +48,4 @@ wx down
 wx up --proxy new-proxy:port
 ```
 
-Or update the `PROXY` environment variable and recreate:
-
-```bash
-docker compose down
-PROXY=new-proxy:port docker compose up -d
-```
+For a Compose-managed deployment, use an approved deployment-specific proxy configuration; the canonical Compose file does not accept `PROXY`.

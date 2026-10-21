@@ -8,16 +8,20 @@ without requiring manual user interaction. Works on both aarch64 and x86_64.
 Usage:
     chat-select <username>          # Select a chat, output JSON result
     chat-select --list              # List all sessions as JSON
+    chat-select --current           # Read the selected chat, no selection or click
 
 Output (JSON):
     {"ok": true, "username": "filehelper", "index": 3}
-    {"ok": false, "error": "Chat not found in session list"}
+    {"ok": false, "error": "Chat not found in session list",
+     "diagnostic": {"stage": "target", "reason": "target_missing"}}
     {"ok": true, "sessions": {"filehelper": 0, "wxid_xxx": 1, ...}}
+    {"ok": true, "current": "filehelper"}
 """
 import subprocess
 import time
 import sys
 import json
+import math
 import os
 import re
 import shutil
@@ -111,6 +115,70 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+# ── Failure diagnostics ──────────────────────────────────────────────────────
+# Every failing result names where it stopped and why, using the fixed
+# vocabulary below. Values are fixed ASCII identifiers only: no chat identity,
+# title, body, raw helper output, or exception text. The stage/reason pair is
+# enough for the server to choose its own message; the human-readable `error`
+# field is unchanged and keeps its existing wording.
+
+DIAGNOSTIC_STAGES = {
+    "startup", "profile", "enumeration", "target", "ui",
+    "selection", "verification", "lock", "unknown",
+}
+
+DIAGNOSTIC_REASONS = {
+    "not_running", "build_id_unavailable", "unsupported_build", "no_sessions",
+    "unsupported_target", "target_missing", "ui_unavailable", "click_failed",
+    "hook_not_ready", "hook_error", "selection_unverified", "pane_unverified",
+    "vector_unavailable", "selection_busy", "helper_exception", "helper_timeout",
+    "unknown",
+}
+
+# Last stage/reason recorded on this run. Functions that only return None
+# (select_chat) or (profile, error) cannot report a reason themselves, so they
+# record it here for the caller that turns it into a result.
+_diagnostic = None
+
+
+def set_diagnostic(stage, reason):
+    """Record the current failure stage and reason.
+
+    Anything outside the agreed vocabulary is discarded rather than guessed at:
+    a caller that mislabels itself is reported as `unknown` instead of inventing
+    a value the server would have to map. Recording `unknown` also erases a
+    previous, more specific pair, so a stale reason can never be reported for a
+    later failure.
+    """
+    global _diagnostic
+    if stage in DIAGNOSTIC_STAGES and reason in DIAGNOSTIC_REASONS:
+        _diagnostic = (stage, reason)
+    else:
+        _diagnostic = ("unknown", "unknown")
+
+
+def clear_diagnostic():
+    """Forget any recorded stage/reason."""
+    global _diagnostic
+    _diagnostic = None
+
+
+def diagnostic():
+    """The current stage/reason as a JSON object, or None when unclassified."""
+    return None if _diagnostic is None else dict(zip(('stage', 'reason'), _diagnostic))
+
+
+def failure_diagnostic(exc):
+    """Classify an exception by type alone.
+
+    Only the timeout type and the generic case are distinguished; the message is
+    never inspected, because it may contain chat identity or raw helper output.
+    """
+    reason = "helper_timeout" if isinstance(exc, subprocess.TimeoutExpired) \
+        else "helper_exception"
+    return ("unknown", reason)
+
+
 _GH_RE = re.compile(r'^gh_[0-9a-f]+$')
 
 def is_official_account(username):
@@ -119,8 +187,17 @@ def is_official_account(username):
 
 
 def result_json(ok, **kwargs):
-    """Print JSON result and exit."""
+    """Print JSON result and exit.
+
+    A failure carries the recorded stage/reason when one exists. Success never
+    carries it: a diagnostic describes why a run failed, so echoing one on a
+    successful selection would misreport it.
+    """
     out = {"ok": ok, **kwargs}
+    if not ok:
+        diag = diagnostic()
+        if diag is not None:
+            out["diagnostic"] = diag
     print(json.dumps(out))
     sys.exit(0 if ok else 1)
 
@@ -162,14 +239,20 @@ def get_build_id(pid):
 
 
 def get_profile(pid):
-    """Look up build profile by BuildID prefix."""
+    """Look up build profile by BuildID prefix.
+
+    Records why the profile is missing: an unreadable BuildID is a different
+    failure from a BuildID this build has no offsets for.
+    """
     build_id = get_build_id(pid)
     if not build_id:
+        set_diagnostic("profile", "build_id_unavailable")
         return None, "Could not read WeChat BuildID"
     prefix = build_id[:8]
     log(f"[chat-select] BuildID: {build_id[:16]}... prefix={prefix}")
     profile = BUILD_PROFILES.get(prefix)
     if not profile:
+        set_diagnostic("profile", "unsupported_build")
         return None, f"Unknown BuildID prefix: {prefix}. Known: {list(BUILD_PROFILES.keys())}"
     log(f"[chat-select] Profile: SELECT_SESSION=0x{profile['SELECT_SESSION']:x} USERNAME_OFF=0x{profile['USERNAME_OFF']:x}")
     return profile, None
@@ -194,8 +277,87 @@ def has_open_chat_pane(tree):
     return len(found) == 2
 
 
-def find_chat_item_from_a11y(require_open_chat=False):
-    """Use a11y-dump to find a clickable chat list item. Returns (x, y) or None."""
+def _finite(value):
+    """A finite number, or None when the value cannot describe a coordinate."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _visible_rect(bounds):
+    """Normalise a11y bounds to (x0, y0, x1, y1), or None if unusable.
+
+    Missing, non-numeric, non-finite, zero, or negative extents describe no
+    area, so they are refused rather than turned into a point. The computed far
+    edges are checked too: finite x and width can still sum to infinity.
+    """
+    if not isinstance(bounds, dict):
+        return None
+    x = _finite(bounds.get("x"))
+    y = _finite(bounds.get("y"))
+    width = _finite(bounds.get("width"))
+    height = _finite(bounds.get("height"))
+    if None in (x, y, width, height) or width <= 0 or height <= 0:
+        return None
+    far_x, far_y = x + width, y + height
+    if not (math.isfinite(far_x) and math.isfinite(far_y)):
+        return None
+    return (x, y, far_x, far_y)
+
+
+def _intersect(rect, clip):
+    """The overlap of two rectangles, or None when they do not overlap."""
+    x0 = max(rect[0], clip[0])
+    y0 = max(rect[1], clip[1])
+    x1 = min(rect[2], clip[2])
+    y1 = min(rect[3], clip[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _pixel_range(rect):
+    """The whole-pixel span of a rectangle as (x0, y0, x1, y1), or None.
+
+    A click addresses a pixel, so a fractional span that contains none offers
+    nothing to click. Rounding both edges up leaves an integer span only when a
+    pixel really lies inside the rectangle.
+    """
+    if rect is None:
+        return None
+    x0, y0, x1, y1 = (math.ceil(rect[0]), math.ceil(rect[1]),
+                      math.ceil(rect[2]), math.ceil(rect[3]))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1 - 1, y1 - 1)
+
+
+def _center(pixels):
+    """The midpoint of a pixel span, clamped to the span it came from."""
+    x0, y0, x1, y1 = pixels
+    return (min(max((x0 + x1) // 2, x0), x1), min(max((y0 + y1) // 2, y0), y1))
+
+
+def _contains(pixels, point):
+    """Whether an integer point lies within a pixel span, edges included."""
+    x, y = point
+    return pixels[0] <= x <= pixels[2] and pixels[1] <= y <= pixels[3]
+
+
+def find_chat_item_from_a11y(require_open_chat=False, preferred_click=None):
+    """Find a point inside the visible part of the chat list. Returns (x, y) or None.
+
+    The click must land on a row the list is actually showing. A scrolled row
+    keeps bounds that can sit entirely outside the list rectangle, and the
+    centre of such bounds is not a reachable pixel: it can land on the search
+    field or off-screen. Rows are therefore clipped to the Chats rectangle and
+    the centre of a partially visible row is used, which keeps a half-scrolled
+    list clickable without scrolling it. Nothing is scrolled here.
+
+    `preferred_click` is honoured only when the current tree still places it
+    inside a visible row; otherwise the first visible row is used. The tree is
+    read once, so a validated coordinate never triggers a second dump.
+    """
     try:
         log("[chat-select] Getting a11y tree...")
         r = subprocess.run(
@@ -210,21 +372,43 @@ def find_chat_item_from_a11y(require_open_chat=False):
         tree = json.loads(r.stdout)
         # Walk tree to find: list[name="Chats"] > list-item with bounds
         items = []
-        _find_chat_list_items(tree, items, in_chat_list=False)
+        chats = _find_chat_list_items(tree, items, in_chat_list=False)
         if require_open_chat and not (
                 any('SELECTED' in item.get('states', []) for item in items)
                 or has_open_chat_pane(tree)):
             return None
-        if not items:
-            log("[chat-select] No list-item found in Chats list")
+        # Without a usable Chats rectangle there is no known visible area, so
+        # refuse to guess one.
+        if chats is None:
+            log("[chat-select] Chats list has no usable bounds; refusing to guess a click point")
             return None
 
-        # Return center of the first suitable item with valid bounds.
-        item = items[0]
-        b = item["bounds"]
-        cx = b["x"] + b["width"] // 2
-        cy = b["y"] + b["height"] // 2
-        log(f"[chat-select] Found chat item: name={item.get('name', '?')!r} bounds={b} -> click ({cx}, {cy})")
+        visible = []
+        for item in items:
+            rect = _visible_rect(item.get("bounds"))
+            pixels = _pixel_range(_intersect(rect, chats) if rect else None)
+            if pixels:
+                visible.append((item, pixels))
+        if not visible:
+            log("[chat-select] No chat row is visible in the Chats list")
+            return None
+
+        if preferred_click is not None:
+            # The click helper takes integers, so a requested point is judged
+            # on the pixel it will actually address, not on its float value.
+            px = _finite(preferred_click[0])
+            py = _finite(preferred_click[1]) if len(preferred_click) > 1 else None
+            point = None if px is None or py is None else (int(px), int(py))
+            if point is not None and any(_contains(pixels, point) for _, pixels in visible):
+                log(f"[chat-select] Using requested click point {point}: inside a visible row")
+                return point
+            log(f"[chat-select] Requested click point {preferred_click} is not inside a "
+                f"visible chat row; using the live tree instead")
+
+        item, pixels = visible[0]
+        cx, cy = _center(pixels)
+        log(f"[chat-select] Found visible chat item: name={item.get('name', '?')!r} "
+            f"visible={pixels} -> click ({cx}, {cy})")
         return (cx, cy)
     except Exception as e:
         log(f"[chat-select] a11y error: {e}")
@@ -232,22 +416,33 @@ def find_chat_item_from_a11y(require_open_chat=False):
 
 
 def _find_chat_list_items(node, items, in_chat_list):
-    """Recursively find list-item nodes inside the Chats list."""
+    """Collect list-item nodes inside the Chats list, and its own rectangle.
+
+    Returns the Chats list's normalised bounds, or None when the list is
+    absent or its bounds describe no area. Rows are collected as reported: the
+    caller clips them, because a row's own bounds are not proof it is visible.
+    """
     if not node or not isinstance(node, dict):
-        return
+        return None
 
     role = node.get("role", "")
     name = node.get("name", "")
+    is_chats = role == "list" and name == "Chats"
 
     # Detect if we're inside the chat list
-    if role == "list" and name == "Chats":
+    if is_chats:
         in_chat_list = True
 
     if in_chat_list and role == "list-item" and node.get("bounds"):
         items.append(node)
 
+    chats = _visible_rect(node.get("bounds")) if is_chats else None
+
     for child in node.get("children", []):
-        _find_chat_list_items(child, items, in_chat_list)
+        found = _find_chat_list_items(child, items, in_chat_list)
+        if chats is None:
+            chats = found
+    return chats
 
 
 def write_js(path, content):
@@ -603,36 +798,63 @@ console.log('READY');
 
 
 def select_chat(pid, profile, target, click_coords):
-    """Resolve identity on the UI thread, then require return and readback."""
+    """Resolve identity on the UI thread, then require return and readback.
+
+    Records the stage/reason of each way this can fail, then returns None as
+    before: the caller decides the failure message from `diagnostic()`.
+    """
     with script_path() as path:
         write_js(path, selection_script(profile, target))
-        proc = run_frida_bg(pid, path)
+        try:
+            proc = run_frida_bg(pid, path)
+        except RuntimeError:
+            set_diagnostic("selection", "hook_not_ready")
+            raise
         try:
             cx, cy = click_coords
-            click = subprocess.run(['/opt/tools/click', str(cx), str(cy)],
-                                   timeout=5, capture_output=True, text=True)
+            try:
+                click = subprocess.run(['/opt/tools/click', str(cx), str(cy)],
+                                       timeout=5, capture_output=True, text=True)
+            except subprocess.TimeoutExpired:
+                set_diagnostic("selection", "helper_timeout")
+                raise
             if click.returncode != 0:
+                set_diagnostic("selection", "click_failed")
                 return None
             lines = read_lines_until(proc, 8, 'SELECTION_VERIFIED')
             if 'SELECTION_VERIFIED' not in lines:
                 log('[chat-select] Selection did not return with the requested identity')
                 log('[chat-select] Hook status: ' + repr(lines))
+                # The hook reported its own setup error, or it produced no
+                # evidence of the selection. Readiness is not in question here:
+                # run_frida_bg returns only after READY arrived, so an empty or
+                # partial line list gives no verified selection evidence; it
+                # does not prove that the hook was unready. hook_not_ready is
+                # reserved for the earlier check where READY did not arrive.
+                if any(line.startswith('SELECTION_ERROR') for line in lines):
+                    set_diagnostic("selection", "hook_error")
+                else:
+                    set_diagnostic("selection", "selection_unverified")
                 return None
             for line in lines:
                 if line.startswith('SELECTED_INDEX '):
                     return int(line.split()[1])
+            set_diagnostic("verification", "selection_unverified")
             return None
         finally:
             kill_frida(proc)
 
 
 def main():
-    # Parse args: chat-select [--force] [--click-xy X Y] [--list] <username>
+    # Parse args: chat-select [--force] [--click-xy X Y] [--current|--list] <username>
+    clear_diagnostic()
     args = sys.argv[1:]
     if not args:
-        result_json(False, error="Usage: chat-select [--force] [--click-xy X Y] <username> | chat-select --list")
+        set_diagnostic("startup", "unknown")
+        result_json(False, error="Usage: chat-select [--force] [--click-xy X Y] <username> | chat-select --list | chat-select --current")
 
     click_xy = None
+    current_mode = False
     positional = []
 
     i = 0
@@ -643,21 +865,34 @@ def main():
             i += 1
         elif args[i] == "--click-xy":
             if i + 2 >= len(args):
+                set_diagnostic("startup", "unknown")
                 result_json(False, error="--click-xy requires X Y arguments")
             click_xy = (int(args[i + 1]), int(args[i + 2]))
             i += 3
+        elif args[i] == "--current":
+            # Pure read: report the native selection without selecting or
+            # clicking anything.
+            current_mode = True
+            i += 1
         else:
             positional.append(args[i])
             i += 1
 
-    if not positional:
-        result_json(False, error="Usage: chat-select [--force] [--click-xy X Y] <username> | chat-select --list")
+    if current_mode and positional:
+        set_diagnostic("startup", "unknown")
+        result_json(False, error="--current does not take a username")
+
+    if not current_mode and not positional:
+        set_diagnostic("startup", "unknown")
+        result_json(False, error="Usage: chat-select [--force] [--click-xy X Y] <username> | chat-select --list | chat-select --current")
 
     pid = get_pid()
     if not pid:
+        set_diagnostic("startup", "not_running")
         result_json(False, error="WeChat is not running")
     log(f"[chat-select] WeChat PID={pid}")
 
+    # get_profile records build_id_unavailable vs unsupported_build itself.
     profile, err = get_profile(pid)
     if not profile:
         result_json(False, error=err)
@@ -666,7 +901,12 @@ def main():
     log("[chat-select] Enumerating sessions...")
     sessions, vector_base, vector_count, current_sel = enumerate_sessions(pid, profile)
     if not sessions:
+        set_diagnostic("enumeration", "no_sessions")
         result_json(False, error="No sessions found. Is WeChat logged in with chats visible?")
+
+    # --current mode: report the selected chat, never select or click
+    if current_mode:
+        result_json(True, current=current_sel)
 
     # --list mode
     if positional[0] == "--list":
@@ -674,8 +914,10 @@ def main():
 
     target = positional[0]
     if is_official_account(target):
+        set_diagnostic("target", "unsupported_target")
         result_json(False, error=f"'{target}' is an official account and cannot be opened")
     if target not in sessions:
+        set_diagnostic("target", "target_missing")
         matches = [u for u in sessions if target.lower() in u.lower()]
         if matches:
             result_json(False, error=f"'{target}' not found. Close matches: {matches[:5]}")
@@ -686,8 +928,12 @@ def main():
     log(f"[chat-select] Target: {target} -> index {target_index}")
 
     # A cached/native current identity is not proof that the UI is responsive.
-    available_click = find_chat_item_from_a11y()
+    # --click-xy came from a tree read earlier and can name a row that has since
+    # scrolled out of the list, so it is only a preference: the current tree
+    # decides, and it decides from one dump.
+    available_click = find_chat_item_from_a11y(preferred_click=click_xy)
     if not available_click:
+        set_diagnostic("ui", "ui_unavailable")
         result_json(False, error='Chat UI is not responsive or no chat list is visible')
 
     # ARM reselecting the current native session toggles it closed. A native
@@ -698,19 +944,22 @@ def main():
         log(f"[chat-select] Target already selected (current_sel={current_sel}), skipping")
         result_json(True, username=target, index=target_index, skipped=True)
 
-    # Find click coordinates: use --click-xy if provided, else fall back to a11y
-    click_coords = click_xy or available_click
-    if not click_coords:
-        result_json(False, error="No clickable chat item found in a11y tree. Is the chat list visible?")
-
     # Hook and click
+    click_coords = available_click
     if not vector_base:
+        set_diagnostic("enumeration", "vector_unavailable")
         result_json(False, error="Session vector base address not found")
     index = select_chat(pid, profile, target, click_coords)
     if index is not None and find_chat_item_from_a11y(require_open_chat=True):
         result_json(True, username=target, index=index)
-    else:
-        result_json(False, error="Selection not verified: requested chat did not open or UI did not respond")
+    # select_chat records why it failed; a verified selection with no open pane
+    # failed later, at verification. A None without a recorded reason is
+    # classified here so the failure is never left unexplained.
+    if index is not None:
+        set_diagnostic("verification", "pane_unverified")
+    elif diagnostic() is None:
+        set_diagnostic("selection", "selection_unverified")
+    result_json(False, error="Selection not verified: requested chat did not open or UI did not respond")
 
 
 if __name__ == "__main__":
@@ -719,9 +968,14 @@ if __name__ == "__main__":
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            set_diagnostic("lock", "selection_busy")
             result_json(False, error='Another chat selection is in progress')
         try:
             main()
         except Exception as exc:
             log(f'[chat-select] {type(exc).__name__}: {exc}')
+            # A step that knew why it failed already recorded a more specific
+            # pair; classify only what reached here unclassified, by type.
+            if diagnostic() is None:
+                set_diagnostic(*failure_diagnostic(exc))
             result_json(False, error='Chat selection failed or timed out')

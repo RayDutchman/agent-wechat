@@ -29,5 +29,33 @@ This shows the WeChat desktop client running inside the container via noVNC. You
 ## Notes
 
 - The VNC viewer is served on the same port (6174) as the REST API, under the `/vnc/` path
-- It's read-only by default — you can observe but interactions through the browser are possible
-- No additional configuration is required; it's always available when the container is running
+- It's read-only by default — browser mouse and keyboard input are disabled until interactive access is explicitly enabled
+- The default entrypoint starts the viewer unless `ENABLE_VNC=0`. In that case, manually started viewer processes must be started again after a container restart.
+
+## Authenticated viewer URL
+
+For the default local installation:
+
+```bash
+echo "http://localhost:6174/vnc/?token=$(tr -d '\r\n' < ~/.config/agent-wechat/token)&autoconnect=true"
+```
+
+Open the resulting URL locally and do not share it: it contains the API token. The static viewer page is public, but its WebSocket connection requires authentication.
+
+## Temporary interactive access
+
+Coordinate with connected automation before manual input. For the default container/session, this restarts only the VNC server without `-viewonly`; reconnect the viewer afterward:
+
+```bash
+docker exec agent-wechat bash -c 'pkill -x x11vnc; sleep 1; su -s /bin/bash -c "exec x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1 -listenv6 ::1" wechat &'
+```
+
+Restore read-only access when finished:
+
+```bash
+docker exec agent-wechat bash -c 'pkill -x x11vnc; sleep 1; su -s /bin/bash -c "exec x11vnc -display :99 -forever -nopw -shared -xkb -viewonly -rfbport 5900 -listen 127.0.0.1 -listenv6 ::1" wechat &'
+```
+
+These commands target all `x11vnc` processes in that container and assume user `wechat`, display `:99`, and port `5900`; do not apply them unchanged to a multi-session container. They assume the viewer's WebSocket proxy is already running. The explicit IPv4 and IPv6 loopback bindings matter especially with host networking: `-listen 127.0.0.1` alone does not restrict the IPv6 listener on the tested build.
+
+They do not change the shipped entrypoint. With VNC enabled, a container restart restores its read-only default. With `ENABLE_VNC=0`, these manual processes are not restored automatically; both `x11vnc` and the WebSocket proxy need a separately managed startup procedure. See the [User Guide](/operations/user-guide#desktop-access-and-history-import) for history-import preparation.

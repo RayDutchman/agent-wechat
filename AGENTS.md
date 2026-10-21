@@ -9,9 +9,6 @@ This repository provides a programmable interface to a WeChat Linux client runni
 | `packages/agent-server-rust/` | Axum server, UI plans, sessions, local data readers, media jobs |
 | `packages/shared/` | TypeScript client and types generated from Rust |
 | `packages/cli/` | `wx` command-line client and container management |
-| `packages/openclaw-extension/` | OpenClaw channel, inbound polling and media, outbound messages |
-| `packages/wechaty-puppet/` | Wechaty adapter |
-| `packages/wechaty-gateway/` | Wechaty gateway |
 | `docker/` | Image, entrypoint, and container-side tools |
 | `docs/` | Public documentation site |
 
@@ -19,6 +16,12 @@ The active HTTP routes are assembled in `packages/agent-server-rust/src/router/m
 
 ## Working rules
 
+- Keep `docs/` focused on current usage, architecture, effective contracts, and concise status. Retained incident investigations must be clearly marked as historical.
+- Keep development designs, implementation plans, reviews, and work logs under the repository-root `.superpowers/`, grouped by task: `specs/`, `plans/`, and `sdd/`. Incorporate final effective conclusions into current documentation.
+- Keep backups, rollback artifacts, and retained private evidence under repository-root `backups/`, grouped by task or date and excluded from Git. Obtain explicit scope approval before moving or deleting existing backups; keep sensitive files private.
+- Use repository-root `tmp/` for short-lived verification materials. Remove them after use only within an approved cleanup scope.
+- Record hashes and recheck before writing only when another session or process may concurrently modify the file; ordinary single-writer edits do not require hash bookkeeping.
+- Distinguish implementation, test results, deployment, and human acceptance. Files changed on disk do not establish what a running process has loaded.
 - Use neutral, accurate technical language in code, comments, docs, commits, and PRs. Do not imply unauthorized access or conceal how a feature works.
 - Keep account credentials, tokens, private infrastructure details, and research-only material out of this public repository. Do not link to private research repositories from public docs.
 - Use an isolated test container and test account for behavior changes. Do not send messages to a live bot or modify a production container unless the task explicitly calls for it. Confirm the intended destination before any send.
@@ -38,7 +41,7 @@ Chat selection is implemented by `src/plans/chat_open.rs` and `src/tools/chat_se
 
 Chat, message, and media readers are under `packages/agent-server-rust/src/tools/wechat_*.rs`. Session metadata and access credentials are stored in the agent database (`/data/agent.db` by default); schema changes belong in a new `packages/agent-server-rust/migrations/V*__*.sql` migration. Do not assume a message or its media is present immediately after notification.
 
-`GET /api/messages/{chat_id}/media/{local_id}` first checks locally available media. When native transfer metadata is available, the server can queue a transfer through `src/tools/media_download.rs`, wait up to 20 seconds for local bytes, and otherwise return `pending`. The transfer is server-owned; an HTTP disconnect does not cancel its submission. Callers should retry a pending result with a bounded policy. Never present raw message XML as a successfully retrieved attachment.
+`GET /api/v2/messages/{server_id}/media` resolves the message within the current account and first checks locally available media. Optional `chat_username` narrows the lookup. When native transfer metadata is available, the server can queue a transfer through `src/tools/media_download.rs`, wait up to 20 seconds for local bytes, and otherwise return `pending`. The transfer is server-owned; an HTTP disconnect does not cancel its submission. Callers should retry a pending result with a bounded policy. Never present raw message XML as a successfully retrieved attachment.
 
 For image media, omitted `quality` defaults to `best`. It requests a native transfer only when the message advertises an Original, then returns the best cached variant and labels it in the `quality` field. Explicit `quality=full` is strict. The media endpoint never selects a chat: on the tested AMD64 build, the native full-image request does not fetch the standard-size variant. Opening a chat separately may cause WeChat to cache standard images in the visible history.
 
@@ -50,18 +53,14 @@ The voice endpoints are implemented in `src/router/voice.rs`: create a job with 
 
 Voice sends can partially succeed. Preserve the job's per-chunk statuses and message IDs; after an uncertain send, stop and report `needs_review` instead of resending. A reused idempotency key must not create a duplicate send. Keep the UI guard and health-monitor coordination intact. The CLI surface is `wx messages send <chatId> --voice <path> [--detach]` and `wx messages voice status|cancel <jobId>`.
 
-### OpenClaw integration
-
-The extension polls inbound messages in `packages/openclaw-extension/src/monitor.ts`, stores attachments through `src/attachment-store.ts`, and applies media/catch-up rules in `src/media-delivery.ts`. Group mention policy is separate from direct-message policy. Voice transcription, when configured, uses OpenClaw's media-understanding runtime after message gating. Outbound media is handled in `src/outbound-media.ts`; `audioAsVoice` requests a voice job, while ordinary audio remains a file attachment. Preserve pending/unavailable status and file paths rather than claiming media reached the model when it did not.
-
 ## Development and verification
 
 ```bash
 pnpm install
 pnpm build
 pnpm typecheck
-pnpm --filter @agent-wechat/agent-wechat test
-pnpm --filter @agent-wechat/wechaty-puppet test
+pnpm --filter @agent-wechat/cli test
+pnpm --filter @agent-wechat/shared test
 cargo test --manifest-path packages/agent-server-rust/Cargo.toml
 ```
 

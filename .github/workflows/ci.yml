@@ -28,9 +28,6 @@ jobs:
             ts:
               - 'packages/cli/**'
               - 'packages/shared/**'
-              - 'packages/openclaw-extension/**'
-              - 'packages/wechaty-gateway/**'
-              - 'packages/wechaty-puppet/**'
               - 'pnpm-lock.yaml'
               - 'package.json'
               - 'pnpm-workspace.yaml'

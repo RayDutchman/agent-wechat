@@ -1,0 +1,166 @@
+---
+title: User Guide
+description: Everyday CLI operations, temporary desktop access, and chat-history import preparation.
+---
+
+Examples use the default container `agent-wechat`, session `default`, and port `6174`. Replace these when using a different deployment. Runtime image labels and database sizes are installation-specific, not guarantees of this guide.
+
+This page is an MDX document: open it as text in an editor to read the Markdown headings and commands, or read its rendered version in the documentation site's **Operations → User Guide** section. The site's `docs/astro.config.mjs` file configures navigation; it is not an operational script.
+
+## Start and inspect
+
+```bash
+wx up
+wx auth login
+wx status
+wx chats list
+wx logs
+```
+
+Complete any phone confirmation and wait for the login command to finish. An interrupted command is not proof that the server-side operation stopped; check the existing flow before starting another. The number of chats depends on the account.
+
+`wx status` checks container/server availability and the V2 account observation. `wx auth status` also uses that account API. Login status is a UI observation; an unrecognized UI is `unknown`, not proof of login. The old `/api/status` and `/api/status/auth` reads are retired.
+
+For an existing container, `docker stop agent-wechat` and `docker start agent-wechat` stop and start it. Coordinate these with connected automation. `wx down` removes the container while retaining its data volumes; it is not the same operation as stopping it.
+
+## Read chats, contacts, and messages
+
+```bash
+wx chats list -l 100 -j
+wx chats list --all --json
+wx chats list --expected-account-username "wxid_example"
+wx chats get <chatId>
+wx chats find "File Transfer"
+wx chats members "room-id@chatroom" --all
+wx contacts list --kind official --all --json --expected-account-username "wxid_example"
+wx contacts find "Alice"
+wx messages list <chatId> --limit 20 --json
+wx messages list <chatId> --all --json --order desc --config ./message-types.json
+```
+
+Use returned chat identifiers rather than assuming names are unique. Message IDs use the native `server_id`; `local_id` remains an internal row locator and is not globally unique. Contacts, chats, members, and messages use V2 cursor pagination: `--cursor` reads one page, and `--all` follows pages serially and releases the retained sample in a `finally` path. With `--all --json`, each output line is the original snake_case page envelope. A short page may still have a cursor; only `next_cursor: null` means complete. Message list order defaults to newest first and can be set to `asc` or `desc`. A cursor-only continuation inherits its original order and filters; explicitly changing them is rejected. `--expected-account-username` passes account intent on the initial request only and is checked against the captured account identity.
+
+The optional `--config` file is JSON with only `include` and `exclude` message type arrays. For example:
+
+```json
+{
+  "include": [{"type": 1}, {"type": 49, "sub_type": 6}, {"type": 49, "sub_type": 19}],
+  "exclude": [{"type": 10000}]
+}
+```
+
+With message `--json`, each message keeps the V2 `reference`, `forwarded_record`, and independent `xml_sub_type` fields alongside the existing `content` and opaque `raw_content`. A missing/invalid V2 message timestamp remains JSON `null` and displays as `—`; it is not substituted with an epoch or current time. Human-readable output shows the quoted author/display label separately and lists the forwarded entry type, source name/hash, and source timestamps/IDs. A missing quoted-author username is not inferred from the display name. Forwarded XML parsing is bounded and reports `complete`, `truncated`, or `invalid`; it does not fetch embedded URLs or send nested entries.
+
+Omitting `include` means all types; an empty `include` array means no types. Types within one array are ORed, include/exclude dimensions are ANDed, and exclusions win. Sub-types require their parent type. Unknown numeric codes remain filterable and preserved. Type labels share one generated dictionary for API and CLI; unknown codes are displayed with their original number.
+
+## Retrieve media
+
+```bash
+wx messages media <chatId> <localId>
+wx messages media <chatId> --server-id 9168265261376983777
+wx messages media <chatId> <localId> --full
+wx messages media <chatId> <localId> --thumbnail
+wx messages media <chatId> <localId> -o /tmp/media.jpg
+```
+
+The default requests the best available image. `--full` requires the original variant and can remain unavailable. Media may be `pending`; retry with a bounded policy. A video response containing JPEG bytes is a preview, not the video itself. Never treat message XML or an empty result as an attachment.
+
+The existing `wx messages media <chatId> <localId>` syntax is resolved through V2 frozen message pages and must match one record with a nonzero native `server_id`; the CLI releases the page sample before requesting media. Ambiguous records, paging failures, and missing server IDs are errors, not a reason to use the local ID as a server ID. `wx messages media <chatId> --server-id <decimal-id>` uses the V2 media route directly. Do not provide both IDs. Raw voice remains available through the API/shared client; this CLI media command does not add a voice-send path.
+
+```bash
+wx chats open <chatId>
+wx chats open <chatId> --clear-unreads
+```
+
+Opening a chat may let WeChat cache media in visible history; it does not guarantee downloading every attachment. The media endpoint itself does not select a chat.
+
+## Send and inspect voice jobs
+
+Confirm the destination before sending. GUI-changing automation is serialized by the server, but manual desktop input is not covered by that guard.
+
+```bash
+wx messages send <chatId> --text "Hello"
+wx messages send <chatId> --image /path/photo.jpg
+wx messages send <chatId> --file /path/document.pdf
+wx messages send <chatId> --text "caption" --image /path/photo.jpg --json
+wx messages send <chatId> --voice /path/audio.wav
+wx messages send <chatId> --voice /path/audio.wav --detach
+wx messages voice status <jobId>
+wx messages voice cancel <jobId>
+```
+
+Synchronous text/image/file sends use one `POST /api/v2/messages/send`. If several are provided, exactly one is selected in file > image > text priority; the CLI reports ignored fields on stderr, and `--json` writes only the V2 response JSON to stdout. This is not a multi-message or caption feature. `success`/`ui_confirmed` describe local UI confirmation, not remote delivery. A timeout or incomplete HTTP response is uncertain; do not blindly retry.
+
+An uncertain send must not be blindly repeated. Voice jobs can partially succeed; `needs_review` requires checking what was actually sent. V2 file sends preserve the supplied basename after server-side validation.
+
+## Sessions and debugging
+
+```bash
+wx session list
+wx session create mytest
+wx session start <id>
+wx session stop <id>
+wx -s <name> chats list
+wx screenshot /tmp/wechat-screen.png
+wx a11y
+```
+
+`wx session delete <id>` can remove the session's Linux user and home data. It is not a logout command. Screenshots and accessibility trees may contain private messages; keep diagnostic files outside the repository.
+
+## HTTP access
+
+```bash
+TOKEN=$(tr -d '\r\n' < ~/.config/agent-wechat/token)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:6174/api/v2/chats
+```
+
+Keep the token and authenticated viewer URLs private. The [API reference](/reference/api) is the maintained route inventory. In particular, `/api/ws/login` drives the login flow and `POST /api/status/login` only inspects a QR screenshot.
+
+The change subscription is available as a CLI listener when the matching server and file-watcher helper are installed:
+
+```bash
+wx events watch --json
+```
+
+The shared client's `onStatus` callback reports `connecting`, `connected`, `reconnecting`, or `closed`; the CLI writes these states to stderr. In JSON mode, stdout contains only newline-delimited `{"type":"data_changed"}` events. The authenticated `/api/ws/events` connection accepts the existing Bearer token or `token` query authentication; a missing or invalid token is rejected before upgrade with HTTP 401 and `{"error":"Unauthorized"}`. The CLI and shared `subscribeChanges({ signal, onStatus })` only listen and reconnect: they do not read messages or invoke a model. Notifications are not replayed or guaranteed, so an integrating consumer must arrange its own catch-up read at startup and after reconnect.
+
+The decoded upload limit is 128 MiB; the HTTP body allowance accounts for base64 expansion and JSON overhead. This does not impose the same size limit on downloaded attachments or source databases.
+
+## Build compatibility and coordinated updates
+
+A successful host `cargo build` does not prove that its binary can run in the container. A host-linked binary requiring newer glibc symbols can fail before the server starts. Use the repository's container build environment (currently `rust:1.93-bookworm`), then verify the resulting executable in the exact target runtime image with no account, production mounts, or published ports. Check both dynamic-library loading and an actual server startup; `ldd` alone is not an application smoke test.
+
+Before updating a running deployment:
+
+1. Coordinate a pause with connected automation and drain in-flight work. Preserve the current binary, helper presence/bytes, ownership, mode, container settings and account identity. Source commit and image tag alone do not identify a hot-replaced executable.
+2. Install the server and `watch-wechat-data.py` as a compatible set; an unchanged helper needs verification rather than another write. Stage on the same filesystem, verify bytes and metadata, then replace the target path.
+3. Signal only the intended server process. Check the entrypoint's actual supervision behavior: a replacement that cannot start can terminate the container and its WeChat process even if the old server exited gracefully. Stop on failure rather than repeatedly restarting.
+4. Verify the new process executable, health, expected account and minimal authenticated V2/WebSocket operations. A successful handshake does not prove that a real message was delivered by an event instead of a periodic catch-up read.
+5. If recovery requires starting a stopped container, coordinate that separately: it restarts WeChat and may require phone confirmation. Restore only the authorized artifacts, record any retained helper, and let the automation owner decide when to resume. Do not retry uncertain messages as part of recovery.
+
+Keep installation-specific hashes, acceptance evidence and backup locations in private local records, not public source or credentials in command examples. Preserve the known-good artifacts until the new deployment has been accepted.
+
+## Desktop access and history import
+
+See [VNC Viewer](/operations/vnc) for the authenticated URL, temporary interactive access, and how to restore read-only mode. Keep the image's read-only default.
+
+For phone chat history, use the WeChat client's own migration or restore facility if supported by the installed client. Do not substitute direct database-directory replacement. Prepare the operation in this order:
+
+1. Pause connected receivers, senders, and background jobs; ensure no in-flight model/tool operation can send during migration.
+2. Establish how imported history will be recorded without executing old messages. Existing chat checkpoints may interpret newly assigned local IDs as new input; first-start history handling alone is not a migration guarantee. Do not erase checkpoints to force a rescan.
+3. Make coordinated, consistent backups of both actual container data mounts and the connected application's ledger. Merely archiving active database files is not a consistency guarantee. Record the runtime version and mount mapping needed for recovery.
+4. Enable temporary interactive VNC and first migrate a small selected chat through the client's UI. Verify old/new message timestamps and sample attachments in WeChat before expanding the import.
+5. Check the imported data through the API and inspect the largest database. The 512 MiB snapshot-processing budget includes the source database, WAL, merge index, and merged copy; it is not a promise that arbitrary multi-gigabyte databases are supported.
+6. Apply the agreed history-only baseline, restore read-only VNC, and resume automation only after imported records are excluded from automatic replies or historical command execution.
+
+This is a preparation workflow, not a claim that cross-platform history migration has been verified for every WeChat build. Volume names, backup procedures, and application baseline handling must match the actual deployment. See [Data & Storage](/operations/data).
+
+### Network mode and a tested migration workaround
+
+Host networking removes Docker's network-address translation and port-publishing layer, but it does not guarantee that phone-to-desktop discovery or transfer will work. In one tested deployment, migration succeeded in a Linux VM with an external virtual switch and a host-networked container, while a WSL2 host-networked container still failed. Bridge networking in that VM was not tested, so this does not establish that bridge mode cannot work.
+
+An existing container retains its network mode across stop/start. When recreating a host-networked deployment, preserve `--network host`, its capabilities, data mounts, token and runtime version explicitly. For the tested dual-stack API listener, `AGENT_HOST=[::]` worked with port `6174`; verify IPv4 and IPv6 reachability on the target host. Keep unauthenticated VNC listeners on loopback, including IPv6. These are deployment choices, not changes to the project's default container networking.
+
+The tested workaround used the same runtime on both machines: stop the original instance, move both complete data mounts and the matching agent-database token to the VM, perform the client's native phone migration, then stop the VM and restore both complete mounts to the original machine. Archives were made only while the owning container was stopped, restored with ownership and permissions, and compared before startup. Only one instance using the migrated account data ran at a time. This is a cold move of the same Linux deployment, not arbitrary replacement with Windows database files.
+
+After returning, verify the account and sample history through the API, then establish a new history-only baseline before restarting connected automation. Imported records must not trigger old commands, replies or transcription. A successful migration does not guarantee that every historical message type is parsed; retain and classify parsing failures separately. Keep the original backup until recovery and application checks are complete.

@@ -23,99 +23,209 @@ use crate::tools::exec::ExecOptions;
 use crate::tools::qr::{decode_qr_from_base64, to_data_url};
 use crate::tools::screenshot::capture_screenshot;
 
-pub async fn get_status() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "container": "running",
-        "loginState": { "status": "logged_out" },
-        "version": "0.1.0"
-    }))
+/// Observe the current account for the V2 contract. This is deliberately a
+/// fresh, bounded observation: persisted login state is never used as evidence.
+pub async fn account_v2() -> Json<serde_json::Value> {
+    let Some(session) = get_session("default") else { return account_unknown("session_unavailable"); };
+    account_observation(&ProcessAccountBackend { session }, std::time::Duration::from_secs(10)).await
 }
 
-/// Check auth status via one FSM observation cycle.
-///
-/// Gets the a11y tree, identifies the current state, and runs
-/// the reducer. Chat states set `is_logged_in = true`.
-pub async fn auth_status() -> Json<serde_json::Value> {
-    let session = match get_session("default") {
-        Some(s) => s,
-        None => {
-            return Json(serde_json::json!({
-                "status": "unknown",
-            }))
-        }
-    };
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountScope { account_username: String, epoch: String }
 
-    // Check if WeChat process is running first
-    let wechat_running = crate::tools::wechat_db::find_wechat_pid().is_some();
-    if !wechat_running {
-        return Json(serde_json::json!({
-            "status": "app_not_running",
-            "loggedInUser": session.logged_in_user,
-        }));
+#[async_trait::async_trait]
+trait AccountObservationBackend: Send + Sync {
+    fn process_running(&self) -> bool;
+    async fn capture_scope(&self) -> Result<AccountScope, &'static str>;
+    async fn observe_ui_logged_in(&self) -> Result<bool, &'static str>;
+}
+
+struct ProcessAccountBackend { session: crate::ia::types::Session }
+
+#[async_trait::async_trait]
+impl AccountObservationBackend for ProcessAccountBackend {
+    fn process_running(&self) -> bool { crate::tools::wechat_db::find_wechat_pid().is_some() }
+    async fn capture_scope(&self) -> Result<AccountScope, &'static str> {
+        use crate::tools::wechat_messages::CollectionCancel;
+        let cancel = CollectionCancel::within(std::time::Duration::from_secs(8));
+        let worker_cancel = cancel.clone();
+        let _cancel = CancelCollectionOnDrop(cancel);
+        let identity = tokio::task::spawn_blocking(move || {
+            crate::tools::wechat_read_identity::capture_read_identity_for(
+                crate::tools::wechat_read_identity::DEFAULT_SESSION_ID, &worker_cancel,
+            )
+        }).await.map_err(|_| "identity_unavailable")?.map_err(|_| "identity_unavailable")?;
+        Ok(AccountScope { account_username: identity.account_id().to_owned(), epoch: identity.epoch().to_owned() })
+    }
+    async fn observe_ui_logged_in(&self) -> Result<bool, &'static str> {
+        let options = ExecOptions { session: Some(self.session.clone()), timeout_ms: 8_000 };
+        let a11y = get_a11y_desktop(&options).await.map_err(|_| "observation_failed")?;
+        let screenshot = capture_screenshot(&options).await.map_err(|_| "observation_failed")?;
+        let identified = identify_states(&a11y, &screenshot);
+        let context = { let db = get_db(); create_context(self.session.clone(), &db) };
+        let screenshot_bytes = base64::engine::general_purpose::STANDARD.decode(&screenshot).unwrap_or_default();
+        let observed = observed_auth_state(&context.state, &identified, &a11y, &screenshot_bytes)
+            .ok_or("observation_failed")?;
+        Ok(observed.main_window.is_logged_in)
+    }
+}
+
+struct CancelCollectionOnDrop(crate::tools::wechat_messages::CollectionCancel);
+impl Drop for CancelCollectionOnDrop { fn drop(&mut self) { self.0.cancel(); } }
+
+fn account_unknown(code: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status":"unknown","account_username":null,"error_code":code}))
+}
+
+async fn account_observation<B: AccountObservationBackend>(backend: &B, budget: std::time::Duration) -> Json<serde_json::Value> {
+    if !backend.process_running() {
+        return Json(serde_json::json!({"status":"app_not_running","account_username":null,"error_code":null}));
+    }
+    match tokio::time::timeout(budget, account_observation_inner(backend)).await {
+        Ok(Ok(response)) => Json(response),
+        Ok(Err(code)) => account_unknown(code),
+        Err(_) => account_unknown("observation_timeout"),
+    }
+}
+
+async fn account_observation_inner<B: AccountObservationBackend>(backend: &B) -> Result<serde_json::Value, &'static str> {
+    let scope_before = backend.capture_scope().await;
+    let logged_in = backend.observe_ui_logged_in().await?;
+    if !logged_in {
+        return Ok(serde_json::json!({"status":"logged_out","account_username":null,"error_code":null}));
+    }
+    let before = scope_before?;
+    let after = backend.capture_scope().await?;
+    if before.epoch != after.epoch { return Err("scope_changed"); }
+    Ok(serde_json::json!({"status":"logged_in","account_username":before.account_username,"error_code":null}))
+}
+
+fn observed_auth_state(
+    prev: &AppState,
+    identified: &IdentifiedStates,
+    a11y: &A11yNode,
+    screenshot: &[u8],
+) -> Option<AppState> {
+    let mw = identified.main_window.as_ref()?;
+    let state_impl = find_state_by_id(&mw.state_id)?;
+    Some(state_impl.reduce(&ReduceArgs { prev, a11y, screenshot }))
+}
+
+#[cfg(test)]
+mod auth_observation_tests {
+    use super::*;
+    use crate::ia::selectors::query_selector;
+    use std::sync::Mutex;
+
+    #[test]
+    fn unknown_tree_does_not_reuse_logged_in_state() {
+        let tree: A11yNode = serde_json::from_value(serde_json::json!({"role":"desktop-frame","name":""})).unwrap();
+        let mut old = AppState::default();
+        old.main_window.is_logged_in = true;
+        old.main_window.view = MainWindowView::ChatOpen;
+        assert!(observed_auth_state(&old, &identify_states(&tree, ""), &tree, &[]).is_none());
     }
 
-    let exec_options = ExecOptions {
-        session: Some(session.clone()),
-        timeout_ms: 30_000,
-    };
-
-    // Run one observation: a11y → identify → reduce
-    let a11y = match get_a11y_desktop(&exec_options).await {
-        Ok(tree) => tree,
-        Err(_) => {
-            return Json(serde_json::json!({
-                "status": "unknown",
-                "loggedInUser": session.logged_in_user,
-            }))
-        }
-    };
-
-    let screenshot = capture_screenshot(&exec_options)
-        .await
-        .unwrap_or_default();
-    let identified = identify_states(&a11y, &screenshot);
-
-    // Load persisted state and apply reduce
-    let mut context = {
-        let db = get_db();
-        create_context(session.clone(), &db)
-    };
-
-    if let Some(ref mw) = identified.main_window {
-        if let Some(state_impl) = find_state_by_id(&mw.state_id) {
-            let screenshot_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&screenshot)
-                .unwrap_or_default();
-            context.state = state_impl.reduce(&ReduceArgs {
-                prev: &context.state,
-                a11y: &a11y,
-                screenshot: &screenshot_bytes,
-            });
-        }
+    #[test]
+    fn recorded_enter_weixin_tree_is_logged_out_and_login_action_matches() {
+        let tree: A11yNode = serde_json::from_str(include_str!("../ia/states/test_fixtures/login_enter_weixin.json")).unwrap();
+        let identified = identify_states(&tree, "");
+        assert_eq!(identified.main_window.as_ref().map(|s| s.state_id.as_str()), Some("login_account"));
+        let mut old = AppState::default();
+        old.main_window.is_logged_in = true;
+        let observed = observed_auth_state(&old, &identified, &tree, &[]).unwrap();
+        assert!(!observed.main_window.is_logged_in);
+        let Action::ClickSelector { selector } = crate::ia::actions::click_login() else { panic!("expected selector") };
+        assert_eq!(query_selector(&tree, &selector).unwrap().name, "Enter Weixin");
     }
 
-    // Save updated state
-    {
-        let db = get_db();
-        context.save(&db);
+    struct FakeAccountBackend {
+        running: bool,
+        ui: Result<bool, &'static str>,
+        scopes: Mutex<Vec<Result<AccountScope, &'static str>>>,
+        pending_ui: bool,
+    }
+    #[async_trait::async_trait]
+    impl AccountObservationBackend for FakeAccountBackend {
+        fn process_running(&self) -> bool { self.running }
+        async fn capture_scope(&self) -> Result<AccountScope, &'static str> {
+            let mut scopes = self.scopes.lock().unwrap();
+            if scopes.len() > 1 { scopes.remove(0) } else { scopes[0].clone() }
+        }
+        async fn observe_ui_logged_in(&self) -> Result<bool, &'static str> {
+            if self.pending_ui { std::future::pending().await } else { self.ui }
+        }
+    }
+    fn fake_account(ui: Result<bool, &'static str>, scopes: Vec<Result<AccountScope, &'static str>>) -> FakeAccountBackend {
+        FakeAccountBackend { running: true, ui, scopes: Mutex::new(scopes), pending_ui: false }
+    }
+    fn account_scope(epoch: &str) -> Result<AccountScope, &'static str> {
+        Ok(AccountScope { account_username: "account-a".into(), epoch: epoch.into() })
     }
 
-    let status = if context.state.main_window.is_logged_in {
-        "logged_in"
-    } else {
-        "logged_out"
-    };
+    #[tokio::test]
+    async fn account_observation_uses_current_ui_identity_and_scope_evidence() {
+        let logged_out = fake_account(Ok(false), vec![Err("identity_unavailable")]);
+        assert_eq!(account_observation(&logged_out, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"logged_out","account_username":null,"error_code":null}));
 
-    tracing::info!(
-        "[auth_status] view={:?}, status={}",
-        context.state.main_window.view,
-        status
-    );
+        let failed_ui = fake_account(Err("observation_failed"), vec![account_scope("1")]);
+        assert_eq!(account_observation(&failed_ui, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"unknown","account_username":null,"error_code":"observation_failed"}));
 
-    Json(serde_json::json!({
-        "status": status,
-        "loggedInUser": session.logged_in_user,
-    }))
+        let no_identity = fake_account(Ok(true), vec![Err("identity_unavailable")]);
+        assert_eq!(account_observation(&no_identity, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"unknown","account_username":null,"error_code":"identity_unavailable"}));
+
+        let switched = fake_account(Ok(true), vec![account_scope("1"), account_scope("2")]);
+        assert_eq!(account_observation(&switched, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"unknown","account_username":null,"error_code":"scope_changed"}));
+
+        let logged_in = fake_account(Ok(true), vec![account_scope("same"), account_scope("same")]);
+        assert_eq!(account_observation(&logged_in, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"logged_in","account_username":"account-a","error_code":null}));
+    }
+
+    #[tokio::test]
+    async fn account_observation_distinguishes_process_absence_and_budget_timeout() {
+        let mut stopped = fake_account(Ok(false), vec![]);
+        stopped.running = false;
+        assert_eq!(account_observation(&stopped, std::time::Duration::from_secs(1)).await.0,
+            serde_json::json!({"status":"app_not_running","account_username":null,"error_code":null}));
+
+        let mut hangs = fake_account(Ok(true), vec![account_scope("same")]);
+        hangs.pending_ui = true;
+        assert_eq!(account_observation(&hangs, std::time::Duration::from_millis(5)).await.0,
+            serde_json::json!({"status":"unknown","account_username":null,"error_code":"observation_timeout"}));
+    }
+
+    #[tokio::test]
+    async fn exports_serialized_account_observation_fixtures_when_requested() {
+        let Ok(path) = std::env::var("V2_CONTRACT_FIXTURE_OUTPUT") else { return; };
+        let mut fixtures: serde_json::Value = std::fs::read(&path).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_else(|| serde_json::json!({}));
+        let mut account = serde_json::Map::new();
+
+        let mut stopped = fake_account(Ok(false), vec![]);
+        stopped.running = false;
+        account.insert("app_not_running".into(), account_observation(&stopped, std::time::Duration::from_secs(1)).await.0);
+
+        let logged_out = fake_account(Ok(false), vec![Err("identity_unavailable")]);
+        account.insert("logged_out".into(), account_observation(&logged_out, std::time::Duration::from_secs(1)).await.0);
+
+        let logged_in = fake_account(Ok(true), vec![account_scope("same"), account_scope("same")]);
+        account.insert("logged_in".into(), account_observation(&logged_in, std::time::Duration::from_secs(1)).await.0);
+
+        let mut timed_out = fake_account(Ok(true), vec![account_scope("same")]);
+        timed_out.pending_ui = true;
+        account.insert("unknown_timeout".into(), account_observation(&timed_out, std::time::Duration::from_millis(5)).await.0);
+
+        let switched = fake_account(Ok(true), vec![account_scope("one"), account_scope("two")]);
+        account.insert("unknown_scope_changed".into(), account_observation(&switched, std::time::Duration::from_secs(1)).await.0);
+
+        fixtures["account"] = serde_json::Value::Object(account);
+        std::fs::write(path, serde_json::to_vec_pretty(&fixtures).unwrap()).unwrap();
+    }
 }
 
 /// Log out of WeChat via FSM execution loop.
@@ -185,7 +295,18 @@ pub async fn logout() -> Json<serde_json::Value> {
     if result.success {
         // Clear logged_in_user from session
         let db = get_db();
-        crate::db::queries::update_session_logged_in_user(&db, &session.id, None);
+        if let Err(error) =
+            crate::db::queries::update_session_logged_in_user(&db, &session.id, None)
+        {
+            // The client is logged out; the row still names the account it no
+            // longer has. Reporting success would let a read be answered from
+            // that row, so the failure is reported as the failure it is and the
+            // session stays quarantined until a write does succeed.
+            return Json(serde_json::json!({
+                "success": false,
+                "error": error.code()
+            }));
+        }
     }
 
     Json(serde_json::json!({

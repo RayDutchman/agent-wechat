@@ -21,12 +21,12 @@ The token serves two purposes:
    ```
    Authorization: Bearer <token>
    ```
-2. **Database encryption** — the token is used to encrypt `agent.db`, the internal database that stores session state and metadata.
+2. **Database encryption** — the same token is the SQLCipher key for `agent.db`, which stores sessions and agent metadata.
 
-The CLI, OpenClaw plugin, and Wechaty puppet all read the token automatically from `~/.config/agent-wechat/token` when connecting to `localhost`.
+`wx` uses the local token file by default. Other clients must be configured with the token and server URL.
 
 :::caution
-Changing or losing the token means `agent.db` can no longer be read. If you regenerate the token, the old database is effectively lost and a new one will be created.
+Replacing or losing the token prevents the existing `agent.db` from being decrypted. Token regeneration does not re-encrypt that database. Preserve the matching token and database together; do not regenerate a token merely to troubleshoot a connection.
 :::
 
 ## Generating a token manually
@@ -45,6 +45,8 @@ Using the CLI:
 wx auth token --regenerate
 ```
 
+Use regeneration only for an intentional credential reset with a corresponding database migration or reinitialization plan. Restarting with a different token alone will not unlock the existing database.
+
 Or manually:
 
 ```bash
@@ -61,13 +63,10 @@ docker compose restart agent-wechat
 
 ## Remote access
 
-When connecting to a remote agent-wechat server, you need the token value:
+When connecting a custom client to an agent-wechat server, provide its URL and token:
 
 ```bash
 cat ~/.config/agent-wechat/token
 ```
 
-Then set it in your client configuration:
-- **OpenClaw**: `"token": "<value>"` in `~/.openclaw/openclaw.json`
-- **Wechaty**: `token: '<value>'` in the puppet constructor
-- **CLI**: `export AGENT_WECHAT_TOKEN=<value>`
+For the CLI, set `AGENT_WECHAT_URL` and `AGENT_WECHAT_TOKEN`. Other clients should send `Authorization: Bearer <token>`; see the [REST API reference](/reference/api).

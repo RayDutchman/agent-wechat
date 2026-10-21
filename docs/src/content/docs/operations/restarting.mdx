@@ -14,22 +14,22 @@ wx down && wx up
 ### Via Docker Compose
 
 ```bash
-docker compose restart agent-wechat
+docker compose --env-file deployment.env restart agent-wechat
 ```
 
 Or for a full stop and start:
 
 ```bash
-docker compose down
-docker compose up -d
+docker compose --env-file deployment.env down
+docker compose --env-file deployment.env up -d
 ```
 
 ## What happens on restart
 
 - The WeChat session usually persists across restarts. Scan the QR code in WeChat if prompted.
-- If the session does expire, the API will report a logged-out status. Run `wx auth login` or ask your OpenClaw bot to log in again.
+- If the session does expire, the API will report a logged-out status. Run `wx auth login` to sign in again.
 - The agent database (`/data/agent.db`) persists across restarts.
-- All WeChat data (messages, contacts, media) persists in the `agent-wechat-home` volume.
+- WeChat data persists in the volume mounted at `/home/wechat`; its name depends on the deployment configuration.
 
 ## When to restart
 
@@ -37,23 +37,23 @@ Restart the container when:
 - The bot stops responding to messages
 - You see "no action selected" errors in the logs
 - The container appears healthy but WeChat is unresponsive
-- After updating the auth token
+- After a coordinated token/database credential change; replacing the token alone does not unlock the existing encrypted database
 
 ## Wiping WeChat data (fresh start)
 
-If restarting doesn't fix the issue, you can wipe the WeChat data and start from scratch. **This will delete all cached messages and media, and you will need to scan the QR code again.**
+For an intentional fresh start, remove the WeChat data volume. **This deletes its messages and media and requires a new login.** Before removing the container, use `docker inspect agent-wechat` to identify the actual named volumes mounted at `/data` and `/home/wechat`; substitute those names below. In local Compose mode, `wx down` only stops the service: remove the stopped container with the same Compose configuration before attempting to remove its volumes.
 
 ```bash
 # Stop the container
 wx down
-# or: docker compose down
+# or: docker compose --env-file deployment.env down
 
 # Remove the WeChat home volume
-docker volume rm agent-wechat-home
+docker volume rm <actual-wechat-home-volume>
 
 # Start fresh
 wx up
-# or: docker compose up -d
+# or: docker compose --env-file deployment.env up -d
 ```
 
 :::caution
@@ -66,7 +66,7 @@ To completely reset both agent data and WeChat data:
 
 ```bash
 wx down
-docker volume rm agent-wechat-data agent-wechat-home
+docker volume rm <actual-agent-data-volume> <actual-wechat-home-volume>
 wx up
 ```
 
@@ -75,4 +75,4 @@ This removes:
 - All WeChat user data
 - The login session
 
-You will need to generate a new auth token and re-scan the QR code.
+You will need to sign in again by scanning the QR code. The host token file is separate and is not removed by deleting these volumes.

@@ -43,6 +43,31 @@ def get_bounds(node):
         return None
 
 
+def get_text_state(node):
+    """Derived TEXT_EMPTY/TEXT_NONEMPTY state for an editable field.
+
+    The accessible ``name`` of an editable field is its label, not its
+    contents, so emptiness cannot be read from ``name``. When the AT-SPI Text
+    interface can be asked for its character count, report a derived state --
+    explicitly *derived*, not a native AT-SPI state. A missing interface, an
+    error or a negative count reports nothing at all (fail closed). The field's
+    contents are never read or emitted.
+    """
+    try:
+        text_iface = node.get_text_iface()
+    except Exception:
+        return None
+    if not text_iface:
+        return None
+    try:
+        count = text_iface.get_character_count()
+    except Exception:
+        return None
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    return "TEXT_EMPTY" if count == 0 else "TEXT_NONEMPTY"
+
+
 def get_states(node):
     """Get accessible states as a list of state names."""
     try:
@@ -70,6 +95,12 @@ def get_states(node):
                              "text", "combo-box", "menu-item", "spin-button"}
         if role in interactive_roles and "ENABLED" not in state_names:
             useful_states.append("DISABLED")
+        # Derived text emptiness for editable fields; never inferred from the
+        # label in `name`. Absent/erroring interface contributes nothing.
+        if role == "text" and "EDITABLE" in state_names:
+            derived = get_text_state(node)
+            if derived:
+                useful_states.append(derived)
         return useful_states if useful_states else None
     except Exception:
         return None
