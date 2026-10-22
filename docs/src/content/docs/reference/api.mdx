@@ -127,7 +127,9 @@ Preserve commit facts even on errors. `ui_confirmed` does not prove recipient de
 
 ## Media quality
 
-For image media, `quality=full` requires the original copy, `standard` requires the mid-size copy, and `thumbnail` requests the preview. Omitted quality defaults to `best`: return the best valid local copy, requesting native full-size transfer only when the message advertises an Original. Wait up to 20 seconds before returning the best cached fallback; the response `quality` labels `full`, `standard` or `thumbnail`.
+For image media, `quality=full` requires the original copy, `standard` requires the mid-size copy, and `thumbnail` requests the preview. Omitted quality defaults to `best`: return the best valid local copy, requesting native full-size transfer only when the message advertises an Original. With `WECHAT_NATIVE_MEDIA_DOWNLOAD=false`, the endpoint uses only local copies and does not submit native requests or wait; the response `quality` labels `full`, `standard` or `thumbnail` when bytes are available.
+
+When native downloads are enabled, the server waits up to 20 seconds before returning the best cached fallback. A `pending` response in this mode can indicate that native media is unavailable; it does not guarantee a request was queued.
 
 A regular phone send may advertise only a standard image. Opening its chat separately can make WeChat cache it; the media endpoint never selects a chat. Without that copy, `best` can return a thumbnail while strict `standard` has no image bytes. Pending results require bounded retries; disconnecting HTTP does not cancel an already submitted server-owned transfer. Raw message XML is not a retrieved attachment.
 

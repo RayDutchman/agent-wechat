@@ -265,6 +265,10 @@ fn parse_kind(raw: &str) -> Result<ContactKind, V2Error> {
     }
 }
 
+fn with_native_media<T>(enabled: bool, build: impl FnOnce() -> T) -> Option<T> {
+    enabled.then(build)
+}
+
 #[async_trait::async_trait]
 trait V2Backend: Send + Sync + 'static {
     async fn capture(&self, cancel: &CollectionCancel) -> Result<ReadId, ReadError>;
@@ -275,16 +279,36 @@ trait V2Backend: Send + Sync + 'static {
     async fn messages(&self, id: &ReadId, keys: &HashMap<String, String>, chat: &str, cancel: &CollectionCancel) -> Result<Vec<Value>, V2Error>;
     async fn locate_message(&self, id: &ReadId, keys: &HashMap<String, String>, server_id: i64, chat: Option<&str>, cancel: &CollectionCancel) -> Result<MessageSourceAnchor, V2Error>;
     async fn voice(&self, id: &ReadId, request: &VoiceRequest, keys: &HashMap<String, String>, cancel: &CollectionCancel) -> Result<read::VerifiedVoice, V2Error>;
+    async fn media(&self, account: String, keys: HashMap<String, String>, chat: String, anchor: MessageSourceAnchor, image_keys: Option<(String, Option<u8>)>, quality: crate::tools::wechat_media::ImageQuality) -> (crate::ia::types::MediaResult, String);
+    fn image_keys(&self, id: &ReadId) -> Option<(String, Option<u8>)>;
 }
 
 #[async_trait::async_trait]
 impl V2Backend for ProcessReadBackend {
+    fn image_keys(&self, id: &ReadId) -> Option<(String, Option<u8>)> {
+        let db = crate::db::get_db();
+        crate::tools::wechat_keys::get_image_keys(&db, &id.session_id, &id.account_dir)
+    }
+
     async fn capture(&self, cancel: &CollectionCancel) -> Result<ReadId, ReadError> {
         ReadBackend::capture_identity(self, cancel).await
     }
 
     async fn contact_keys(&self, id: &ReadId, cancel: &CollectionCancel) -> Result<HashMap<String, String>, ReadError> {
         ReadBackend::contact_keys(self, id, cancel).await
+    }
+
+    async fn media(&self, account: String, keys: HashMap<String, String>, chat: String, anchor: MessageSourceAnchor, image_keys: Option<(String, Option<u8>)>, quality: crate::tools::wechat_media::ImageQuality) -> (crate::ia::types::MediaResult, String) {
+        tokio::task::spawn_blocking(move || {
+            let content = crate::tools::wechat_media::decode_media_message_content(
+                &anchor.raw_source_hex, anchor.raw_source_compressed,
+            );
+            let result = crate::tools::wechat_media::get_message_media_from_anchor(
+                &account, &keys, &chat, anchor.local_id, anchor.local_type,
+                anchor.created, content.clone(), image_keys, quality,
+            );
+            (result, content)
+        }).await.unwrap_or_else(|_| (crate::tools::wechat_media::pending(), String::new()))
     }
 
     async fn contacts(&self, id: &ReadId, keys: &HashMap<String, String>, cancel: &CollectionCancel) -> Result<Vec<Value>, V2Error> {
@@ -793,6 +817,16 @@ async fn message_media_by_server_id_handler<B: V2Backend>(
     State(backend): State<Arc<B>>, AxumPath(raw_id): AxumPath<String>, RawQuery(raw): RawQuery,
     budget: Option<Extension<RoundBudget>>,
 ) -> Result<Json<Value>, V2Error> {
+    message_media_by_server_id_handler_with_policy(
+        State(backend), AxumPath(raw_id), RawQuery(raw), budget,
+        crate::tools::media_download::enabled(),
+    ).await
+}
+
+async fn message_media_by_server_id_handler_with_policy<B: V2Backend>(
+    State(backend): State<Arc<B>>, AxumPath(raw_id): AxumPath<String>, RawQuery(raw): RawQuery,
+    budget: Option<Extension<RoundBudget>>, native_media_enabled: bool,
+) -> Result<Json<Value>, V2Error> {
     use crate::tools::wechat_media::{best_image_target, download_metadata_from_anchor, get_message_media_from_anchor, pending, ImageQuality};
     use crate::tools::media_download::{current_process, ensure_queued};
 
@@ -810,10 +844,7 @@ async fn message_media_by_server_id_handler<B: V2Backend>(
     if keys != after_keys || after != id { return Err(V2Error::ScopeChanged); }
     drop(guard);
 
-    let image_keys = {
-        let db = crate::db::get_db();
-        crate::tools::wechat_keys::get_image_keys(&db, &id.session_id, &id.account_dir)
-    };
+    let image_keys = backend.image_keys(&id);
 
     macro_rules! finish_media {
         ($media:expr) => {{
@@ -821,40 +852,30 @@ async fn message_media_by_server_id_handler<B: V2Backend>(
             let _verify_guard = read::take_gui_guard(RoundBudget::default(), &verify_round).await.map_err(V2Error::from)?;
             let verify_id = read::within_round(&verify_round, backend.capture(&verify_round)).await.map_err(V2Error::from)?;
             let verify_keys = read::within_round(&verify_round, backend.contact_keys(&verify_id, &verify_round)).await.map_err(V2Error::from)?;
-            let verify_image_keys = {
-                let db = crate::db::get_db();
-                crate::tools::wechat_keys::get_image_keys(&db, &verify_id.session_id, &verify_id.account_dir)
-            };
+            let verify_image_keys = backend.image_keys(&verify_id);
             if verify_id != id || verify_keys != keys || verify_image_keys != image_keys { return Err(V2Error::ScopeChanged); }
             return serde_json::to_value($media).map(Json).map_err(|_| V2Error::SourceReadFailed);
         }};
     }
 
-    let account = id.account_dir.clone();
-    let chat = anchor.message.chat_username.clone();
-    let image_keys_for_read = image_keys.clone();
-    let read_anchor = anchor.clone();
-    let read_keys = keys.clone();
-    let (result, media_content) = tokio::task::spawn_blocking(move || {
-        let content = crate::tools::wechat_media::decode_media_message_content(
-            &read_anchor.raw_source_hex, read_anchor.raw_source_compressed,
-        );
-        let result = get_message_media_from_anchor(
-            &account, &read_keys, &chat, read_anchor.local_id, read_anchor.local_type,
-            read_anchor.created, content.clone(), image_keys_for_read, quality,
-        );
-        (result, content)
-    }).await.unwrap_or_else(|_| (pending(), String::new()));
+    let (result, media_content) = backend.media(
+        id.account_dir.clone(), keys.clone(), anchor.message.chat_username.clone(),
+        anchor.clone(), image_keys.clone(), quality,
+    ).await;
     if result.media_type == "unsupported"
         || (result.data.is_some() && (quality != ImageQuality::Best || result.media_type != "image" || result.quality.as_deref() == Some("full")))
     {
         finish_media!(result);
     }
-    let metadata = download_metadata_from_anchor(
-        &id.account_id, &anchor.message.chat_username, anchor.message.sender_username.as_deref(),
-        anchor.local_id, anchor.local_type, anchor.server_id, anchor.sort_seq.as_deref(),
-        anchor.created, &media_content,
-    );
+    let Some(metadata) = with_native_media(native_media_enabled, || {
+        download_metadata_from_anchor(
+            &id.account_id, &anchor.message.chat_username, anchor.message.sender_username.as_deref(),
+            anchor.local_id, anchor.local_type, anchor.server_id, anchor.sort_seq.as_deref(),
+            anchor.created, &media_content,
+        )
+    }) else {
+        finish_media!(result);
+    };
     let Some(metadata) = metadata else { finish_media!(result); };
     let advertised = best_image_target(metadata["content"].as_str().unwrap_or(""));
     let target_rank = if quality == ImageQuality::Best && metadata["local_type"] == 3 { crate::router::messages::image_quality_rank(Some(advertised)) } else { 0 };
@@ -933,20 +954,65 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[test]
+    fn disabled_native_transfer_skips_native_metadata_construction() {
+        let mut built = false;
+        let returned = with_native_media(false, || {
+            built = true;
+            Some("native-metadata")
+        });
+        assert!(!built);
+        assert_eq!(returned, None);
+    }
+
+    fn media_result(media_type: &str, data: Option<&str>, quality: Option<&str>) -> crate::ia::types::MediaResult {
+        crate::ia::types::MediaResult {
+            media_type: media_type.into(), data: data.map(str::to_string), url: None,
+            format: "png".into(), filename: "image.png".into(), quality: quality.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_native_media_handler_returns_local_cache_and_pending_without_waiting_or_parsing_metadata() {
+        for local_result in [
+            media_result("image", Some("cached-image-bytes"), Some("thumbnail")),
+            media_result("pending", None, None),
+        ] {
+            let backend = FakeBackend::with_media_result(vec![message_row("77", 1, 0, 7)], local_result.clone());
+            let started = std::time::Instant::now();
+            let response = message_media_by_server_id_handler_with_policy(
+                State(backend), AxumPath("77".into()), RawQuery(None), None, false,
+            ).await.unwrap().0;
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(response["type"], local_result.media_type);
+            if let Some(data) = local_result.data { assert_eq!(response["data"], data); }
+            else { assert!(response.get("data").is_none()); }
+            if let Some(quality) = local_result.quality { assert_eq!(response["quality"], quality); }
+            else { assert!(response.get("quality").is_none()); }
+        }
+    }
+
     struct FakeBackend {
         identities: Mutex<VecDeque<ReadId>>,
         rows: Vec<Value>,
         contact_collections: AtomicUsize,
         voice_requests: Mutex<Vec<VoiceRequest>>,
+        media_result: Mutex<Option<crate::ia::types::MediaResult>>,
     }
 
     impl FakeBackend {
         fn new(rows: Vec<Value>) -> Arc<Self> {
-            Arc::new(Self { identities: Mutex::new(VecDeque::from([test_id("acct-a", "epoch-a")])), rows, contact_collections: AtomicUsize::new(0), voice_requests: Mutex::new(Vec::new()) })
+            Arc::new(Self { identities: Mutex::new(VecDeque::from([test_id("acct-a", "epoch-a")])), rows, contact_collections: AtomicUsize::new(0), voice_requests: Mutex::new(Vec::new()), media_result: Mutex::new(None) })
         }
 
         fn identities(rows: Vec<Value>, identities: Vec<ReadId>) -> Arc<Self> {
-            Arc::new(Self { identities: Mutex::new(VecDeque::from(identities)), rows, contact_collections: AtomicUsize::new(0), voice_requests: Mutex::new(Vec::new()) })
+            Arc::new(Self { identities: Mutex::new(VecDeque::from(identities)), rows, contact_collections: AtomicUsize::new(0), voice_requests: Mutex::new(Vec::new()), media_result: Mutex::new(None) })
+        }
+
+        fn with_media_result(rows: Vec<Value>, media_result: crate::ia::types::MediaResult) -> Arc<Self> {
+            let backend = Self::new(rows);
+            *backend.media_result.lock().unwrap() = Some(media_result);
+            backend
         }
 
         fn next_identity(&self) -> ReadId {
@@ -957,6 +1023,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl V2Backend for FakeBackend {
+        fn image_keys(&self, _id: &ReadId) -> Option<(String, Option<u8>)> { None }
         async fn capture(&self, _cancel: &CollectionCancel) -> Result<ReadId, ReadError> { Ok(self.next_identity()) }
         async fn contact_keys(&self, _id: &ReadId, _cancel: &CollectionCancel) -> Result<HashMap<String, String>, ReadError> {
             Ok(HashMap::from([("contact.db".to_string(), "synthetic".to_string()), ("session.db".to_string(), "synthetic".to_string())]))
@@ -988,6 +1055,9 @@ mod tests {
         async fn voice(&self, _id: &ReadId, request: &VoiceRequest, _keys: &HashMap<String, String>, _cancel: &CollectionCancel) -> Result<read::VerifiedVoice, V2Error> {
             self.voice_requests.lock().unwrap().push(request.clone());
             Ok(read::VerifiedVoice { media_shard: "media_0.db".into(), media_row_id: 1, media_owner_id: 2, audio: vec![0x02, 0x23], sha256: "synthetic".into() })
+        }
+        async fn media(&self, _account: String, _keys: HashMap<String, String>, _chat: String, _anchor: MessageSourceAnchor, _image_keys: Option<(String, Option<u8>)>, _quality: crate::tools::wechat_media::ImageQuality) -> (crate::ia::types::MediaResult, String) {
+            (self.media_result.lock().unwrap().clone().unwrap_or_else(crate::tools::wechat_media::pending), "not-valid-native-metadata".into())
         }
     }
 
