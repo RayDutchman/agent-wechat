@@ -1193,7 +1193,11 @@ mod tests {
             "message_lookup_request": {"method": "GET", "path": "/api/v2/messages/78", "query": {"chat_username": "chat-a"}},
             "message_lookup": lookup
         });
-        std::fs::write("/tmp/opencode/source-field-semantics-fixtures.json", serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        // Fixture export is opt-in, like the send-contract fixtures. Running
+        // assertions must not depend on a developer's local evidence directory.
+        if let Ok(path) = std::env::var("V2_READ_CONTRACT_FIXTURE_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        }
     }
 
     #[tokio::test]

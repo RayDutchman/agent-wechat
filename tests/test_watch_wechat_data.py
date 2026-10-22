@@ -198,6 +198,35 @@ class WatchWechatDataTests(unittest.TestCase):
                 proc.stdout.close()
                 proc.stderr.close()
 
+    def test_shm_events_are_ignored_but_wal_events_are_emitted(self):
+        module = load_watcher_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            # Construct synchronously so watches are installed before mutation.
+            watcher = module.Watcher(tmp)
+            real_select = select.select
+
+            def until_idle(readers, writers, errors, timeout):
+                ready = real_select(readers, writers, errors, 0.1)
+                if not ready[0]:
+                    module.running = False
+                return ready
+
+            try:
+                # Feed real inotify events into the real run loop. Separate
+                # batches prevent earlier DB notifications contaminating the
+                # negative SHM assertion.
+                for name, expected in [("part.db-shm", ""), ("part.db-wal", "changed\n")]:
+                    pathlib.Path(tmp, name).write_bytes(b"synthetic")
+                    module.running = True
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), mock.patch.object(
+                        module.select, "select", side_effect=until_idle
+                    ):
+                        watcher.run()
+                    self.assertEqual(output.getvalue(), expected)
+            finally:
+                os.close(watcher.fd)
+
     def test_file_and_new_subdirectory_changes_and_sigterm(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "data"
@@ -206,48 +235,57 @@ class WatchWechatDataTests(unittest.TestCase):
                 [sys.executable, str(SCRIPT), str(root)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                bufsize=0,
             )
+            def read_change(timeout):
+                if not select.select([proc.stdout], [], [], timeout)[0]:
+                    return False
+                data = os.read(proc.stdout.fileno(), 65536)
+                self.assertTrue(data, "watcher exited before emitting a hint")
+                # One file operation can yield several inotify read batches.
+                # Drain that operation before starting the next one. Use raw
+                # reads: TextIOWrapper can hide ready lines from select().
+                deadline = time.monotonic() + 2
+                while select.select([proc.stdout], [], [], 0.05)[0]:
+                    self.assertLess(time.monotonic(), deadline)
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    self.assertTrue(chunk, "watcher exited while draining hints")
+                    data += chunk
+                self.assertTrue(data.endswith(b"\n"))
+                self.assertEqual(set(data.splitlines()), {b"changed"})
+                return True
+
             try:
                 # Repeat mutations during bounded startup-race window; output is event-driven.
-                events = []
+                ready = False
                 deadline = time.monotonic() + 4
-                while time.monotonic() < deadline and not events:
+                while time.monotonic() < deadline and not ready:
                     (root / "message.db-wal").write_bytes(b"synthetic")
-                    ready, _, _ = select.select([proc.stdout], [], [], 0.1)
-                    if ready:
-                        events.append(proc.stdout.readline())
-                self.assertEqual(events, ["changed\n"])
+                    ready = read_change(0.1)
+                self.assertTrue(ready)
 
                 shard = root / "shard"
                 shard.mkdir()
                 deadline = time.monotonic() + 2
-                ready = []
+                ready = False
                 while time.monotonic() < deadline and not ready:
                     (shard / "part.db").write_bytes(b"synthetic")
-                    ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+                    ready = read_change(0.1)
                 self.assertTrue(ready, "new subdirectory was not watched")
-                self.assertEqual(proc.stdout.readline(), "changed\n")
 
-                # SHM is explicitly excluded; rename, WAL creation and deletion are sources.
-                shm = shard / "part.db-shm"
-                shm.write_bytes(b"synthetic")
-                self.assertFalse(select.select([proc.stdout], [], [], 0.15)[0])
+                # Rename, WAL creation and deletion are sources. SHM exclusion
+                # is tested separately, without pending DB notifications.
                 wal = shard / "part.db-wal"
                 wal.write_bytes(b"synthetic")
-                self.assertTrue(select.select([proc.stdout], [], [], 2)[0])
-                proc.stdout.readline()
+                self.assertTrue(read_change(2))
                 wal.unlink()
-                self.assertTrue(select.select([proc.stdout], [], [], 2)[0])
-                proc.stdout.readline()
+                self.assertTrue(read_change(2))
                 (shard / "part.db").rename(shard / "renamed.db")
-                self.assertTrue(select.select([proc.stdout], [], [], 2)[0])
-                proc.stdout.readline()
+                self.assertTrue(read_change(2))
 
                 proc.terminate()
                 self.assertEqual(proc.wait(timeout=3), 0)
-                self.assertEqual(proc.stderr.read(), "")
+                self.assertEqual(proc.stderr.read(), b"")
             finally:
                 if proc.poll() is None:
                     proc.kill()
