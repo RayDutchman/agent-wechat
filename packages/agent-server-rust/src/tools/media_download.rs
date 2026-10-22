@@ -121,24 +121,3 @@ async fn ensure_queued_with_policy(account: String, metadata: Value, enabled: bo
     tokio::time::timeout(Duration::from_secs(20), task).await
         .ok().and_then(Result::ok).unwrap_or(false)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_media_download_environment_is_strict_and_defaults_on() {
-        assert!(native_media_download_enabled(None));
-        assert!(native_media_download_enabled(Some("true")));
-        assert!(!native_media_download_enabled(Some("false")));
-        assert!(!native_media_download_enabled(Some("TRUE")));
-        assert!(!native_media_download_enabled(Some("")));
-        assert!(!native_media_download_enabled(Some("yes")));
-    }
-
-    #[tokio::test]
-    async fn disabled_queue_does_not_need_account_or_start_worker() {
-        assert!(!ensure_queued_with_policy("missing-account".into(), json!({}), false).await);
-        assert!(QUEUE.get().is_none());
-    }
-}

@@ -285,12 +285,7 @@ def _finite(value):
 
 
 def _visible_rect(bounds):
-    """Normalise a11y bounds to (x0, y0, x1, y1), or None if unusable.
-
-    Missing, non-numeric, non-finite, zero, or negative extents describe no
-    area, so they are refused rather than turned into a point. The computed far
-    edges are checked too: finite x and width can still sum to infinity.
-    """
+    """Return finite, positive bounds as (x0, y0, x1, y1), or None."""
     if not isinstance(bounds, dict):
         return None
     x = _finite(bounds.get("x"))
@@ -317,12 +312,7 @@ def _intersect(rect, clip):
 
 
 def _pixel_range(rect):
-    """The whole-pixel span of a rectangle as (x0, y0, x1, y1), or None.
-
-    A click addresses a pixel, so a fractional span that contains none offers
-    nothing to click. Rounding both edges up leaves an integer span only when a
-    pixel really lies inside the rectangle.
-    """
+    """Return the inclusive integer-pixel span, or None if no pixel fits."""
     if rect is None:
         return None
     x0, y0, x1, y1 = (math.ceil(rect[0]), math.ceil(rect[1]),
@@ -345,18 +335,11 @@ def _contains(pixels, point):
 
 
 def find_chat_item_from_a11y(require_open_chat=False, preferred_click=None):
-    """Find a point inside the visible part of the chat list. Returns (x, y) or None.
+    """Find a visible row click point to trigger the native selection hook.
 
-    The click must land on a row the list is actually showing. A scrolled row
-    keeps bounds that can sit entirely outside the list rectangle, and the
-    centre of such bounds is not a reachable pixel: it can land on the search
-    field or off-screen. Rows are therefore clipped to the Chats rectangle and
-    the centre of a partially visible row is used, which keeps a half-scrolled
-    list clickable without scrolling it. Nothing is scrolled here.
-
-    `preferred_click` is honoured only when the current tree still places it
-    inside a visible row; otherwise the first visible row is used. The tree is
-    read once, so a validated coordinate never triggers a second dump.
+    Clip rows to the Chats bounds; off-screen rows are not clickable. Reuse
+    preferred_click only if this single a11y observation confirms it is visible.
+    Target identity is resolved by the hook, not by the clicked row's label.
     """
     try:
         log("[chat-select] Getting a11y tree...")

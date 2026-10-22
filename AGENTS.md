@@ -28,6 +28,7 @@ The active HTTP routes are assembled in `packages/agent-server-rust/src/router/m
 - Preserve container data and backups unless removal is explicitly requested. The VNC viewer is read-only by default (`docker/entrypoint.sh` uses `x11vnc -viewonly`); do not change that for a shipped image. Temporary interactive debugging must not change the default.
 - WeChat UI behavior is build- and architecture-sensitive. Avoid claiming a local unit test proves end-to-end behavior on another architecture. Verify actual chat selection and message creation in the client when changing UI control.
 - Add a changeset for user-facing behavior or package changes. Documentation-only edits do not need one.
+- Keep tests in separate test files or test directories, never inline in business implementation files. Do not add `#[test]`, `#[tokio::test]`, `#[cfg(test)]` test modules, or test-only hooks to production code.
 
 ## Runtime boundaries
 

@@ -63,8 +63,7 @@ wx messages send <chatId> --text "Hello"
 | `wx auth login` | Log in to WeChat (shows QR code) |
 | `wx auth logout` | Log out of WeChat |
 | `wx auth status` | Check login status |
-| `wx auth token` | Show current auth token |
-| `wx auth token --regenerate` | Generate a new auth token |
+| `wx auth token [--regenerate]` | Show the local API token, or generate a replacement with `--regenerate` |
 
 Login options:
 - `--timeout <seconds>` — login timeout (default: 300)

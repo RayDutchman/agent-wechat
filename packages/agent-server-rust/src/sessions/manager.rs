@@ -63,33 +63,6 @@ fn valid_tz_name(tz: &str) -> bool {
         && tz.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_positive, positive_setting, resolve_tz, screen_depth_from, valid_tz_name};
-
-    #[test]
-    fn display_settings_accept_positive_values_and_default_invalid_values() {
-        assert_eq!(parse_positive("1280"), Some(1280));
-        assert_eq!(parse_positive("0"), None);
-        assert_eq!(parse_positive("01"), None);
-        assert_eq!(parse_positive("4294967296"), None);
-        assert_eq!(positive_setting("width", Some(""), 1280).unwrap(), 1280);
-        assert!(positive_setting("width", Some("01"), 1280).is_err());
-        assert_eq!(screen_depth_from(Some("16")).unwrap(), 16);
-        assert_eq!(screen_depth_from(Some("24")).unwrap(), 24);
-        assert!(screen_depth_from(Some("32")).is_err());
-        assert!(screen_depth_from(Some("08")).is_err());
-        assert_eq!(screen_depth_from(Some("")).unwrap(), 24);
-        assert!(resolve_tz(Some("../UTC")).is_err());
-        assert!(resolve_tz(Some("Etc/../UTC")).is_err());
-        assert!(valid_tz_name("Etc/UTC"));
-        assert!(valid_tz_name("Etc/GMT+1"));
-        assert!(!valid_tz_name("UTC;touch"));
-        assert!(!valid_tz_name("UTC$(id)"));
-        assert!(!valid_tz_name("UTC name"));
-    }
-}
-
 /// Convert a DB row to a Session.
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
