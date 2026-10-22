@@ -3,371 +3,158 @@ title: REST API
 description: API endpoint reference for agent-wechat.
 ---
 
-The agent-wechat server exposes an HTTP API on port `6174`. The active route table below reflects the current router. The detailed audit preserved later in this page is a historical snapshot and is **not** a list of currently registered endpoints.
+The server exposes an HTTP API on port `6174`. This page describes the current router in `packages/agent-server-rust/src/router/mod.rs`, with V2 handlers in `router/read_v2.rs` and `router/send_v2.rs`. A registered route does not by itself prove useful events or message delivery.
 
 数据库字段原义、表间关联、通讯录筛选、消息类型及 `server_id` / `local_id` 的统一解释见 [微信数据库与字段字典](/operations/data)。本页维护 HTTP 契约，不另维护一套源数据库语义。
 
-The registration sources are `packages/agent-server-rust/src/router/mod.rs:49–119`, `router/read.rs:1571` onward, `router/send_text.rs:464` onward, and `router/send_file.rs:685` onward. All source references below are relative to `packages/agent-server-rust/src/` unless stated otherwise. Line numbers refer to that revision.
-
-API requests require authentication. The `/health` probe is exempt. A route being registered does not establish that it supplies useful events or that its success response proves message delivery.
-
 ## Authentication
 
-```
+```text
 Authorization: Bearer <token>
 ```
 
-The middleware also accepts `?token=...`, used by browser WebSockets. A missing or incorrect token returns 401 with `{"error":"Unauthorized"}`. The noVNC **static** paths under `/vnc/` are also exempt; `/vnc/websockify` is not. There is no separately registered `/api/auth` token-issuing endpoint (`router/auth.rs:34–76`).
+The middleware also accepts `?token=...` for browser WebSockets. Missing or incorrect credentials return 401 with `{"error":"Unauthorized"}`. `/health` and noVNC static resources are exempt; `/vnc/websockify` is authenticated. There is no `/api/auth` token-issuing endpoint.
 
 ## Current HTTP surface
 
-All `/api/*` routes require authentication; `/health` and noVNC static files are exempt. A registered route does not establish useful events or prove message delivery. Uploads remain limited to 128 MiB decoded; JSON requests carry base64 expansion.
+Decoded uploads are limited to 128 MiB; the global body allowance includes base64 expansion plus JSON overhead. Extractor, authentication and body-limit failures can occur outside a handler's result envelope.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Process health only. |
-| GET | `/api/v2/account` | Current account/UI observation; unknown observations remain explicit. |
-| POST | `/api/status/login` | Read login QR state; does not initiate login. |
-| POST | `/api/status/logout` | Execute logout. |
-| POST | `/api/chats/{id}/open` | GUI chat selection. |
-| GET | `/api/v2/contacts`, `/api/v2/chats` | Cursor-paged V2 roster reads. |
+| GET | `/health` | Process health only; not WeChat readiness. |
+| GET | `/api/v2/account` | Fresh account/UI observation; unknown observations remain explicit. |
+| POST | `/api/status/login` | Read current QR state; does not initiate login. |
+| POST | `/api/status/logout` | Execute logout and clear persisted login identity. |
+| POST | `/api/chats/{id}/open` | GUI selection; optional `clearUnreads=false`; returns `ok,username?,index?,error?`, including 200 with `ok:false`. Official accounts are unsupported. |
+| GET | `/api/v2/contacts`, `/api/v2/chats` | Cursor-paged roster reads. |
 | GET | `/api/v2/chats/{username}`, `/api/v2/chats/{username}/members` | Exact chat and group-member reads. |
-| DELETE | `/api/v2/read-snapshots/{release_token}` | V2 frozen-sample release. |
-| GET | `/api/v2/chats/{username}/messages` | Cursor-paged messages for a chat. |
-| GET | `/api/v2/messages/{server_id}`, `/media`, `/voice` | Exact nonzero native `server_id` lookup and media/voice reads. |
-| GET | `/api/v2/message-types` | Message type dictionary. |
-| POST | `/api/v2/messages/send` | Single synchronous send; one chosen payload, file > image > text. |
-| POST / GET | `/api/messages/voice`, `/api/messages/voice/{job_id}` | Independent asynchronous voice jobs. |
-| POST | `/api/messages/voice/{job_id}/cancel` | Cancel a voice job. |
+| DELETE | `/api/v2/read-snapshots/{release_token}` | Release a frozen sample. |
+| GET | `/api/v2/chats/{username}/messages` | Cursor-paged messages. |
+| GET | `/api/v2/messages/{server_id}` | Exact native message lookup. |
+| GET | `/api/v2/messages/{server_id}/media`, `/api/v2/messages/{server_id}/voice` | Media result or raw SILK bytes. |
+| GET | `/api/v2/message-types` | Canonical type dictionary. |
+| POST | `/api/v2/messages/send` | One synchronous send; file > image > text. |
+| POST | `/api/messages/voice` | Create an asynchronous voice job. |
+| GET | `/api/messages/voice/{job_id}` | Read voice job status. |
+| POST | `/api/messages/voice/{job_id}/cancel` | Request cancellation. |
 | GET / POST | `/api/sessions` | List/create sessions. |
 | GET / DELETE | `/api/sessions/{id}` | Read/delete a session. |
-| POST | `/api/sessions/{id}/start`, `/stop` | Start/stop a session. |
+| POST | `/api/sessions/{id}/start`, `/api/sessions/{id}/stop` | Start/stop a session. |
 | GET | `/api/debug/screenshot`, `/api/debug/a11y` | UI diagnostics. |
-| GET | `/api/ws/login`, `/api/ws/events` | Login observation stream and server events. |
-| GET | `/vnc/websockify`, `/vnc/{*path}`, `/vnc/` | VNC websocket and static viewer. |
+| GET | `/api/ws/login`, `/api/ws/events` | WebSocket upgrades described below. |
+| GET | `/vnc/websockify`, `/vnc/{*path}`, `/vnc/` | Authenticated VNC transport and static viewer. |
 
-The retired routes return 404: `/api/status`, `/api/status/auth`, `/api/read/*`, `/api/messages/{chat_id}` and its local-id media route, `/api/messages/send`, `/api/send/text`, `/api/send/file`, and legacy chat/contact list/find/get routes. No compatibility fallback is provided. The old `<chat> <localId>` CLI media syntax, where retained, resolves a unique V2 message page to a nonzero `server_id` and releases the page sample before requesting media.
+Retired routes return 404: `/api/status`, `/api/status/auth`, `/api/read/*`, `/api/messages/{chat_id}` and its local-ID media route, `/api/messages/send`, `/api/send/text`, `/api/send/file`, and legacy chat/contact list/find/get routes. There is no compatibility fallback. The retained `<chat> <localId>` CLI media syntax resolves a unique V2 message to a nonzero `server_id` and releases its page sample before requesting media.
 
-### Historical route audit (not current)
+## V2 reads
 
-The following sections record the V1 inventory at `baf36ff`: **38 explicitly registered method/path pairs, comprising 35 ordinary HTTP endpoints and 3 WebSocket upgrades**. That historical count includes the health probe and two noVNC static-file routes, but not automatic HEAD handling, CORS preflight, or V2 routes. Old route registrations and behavior descriptions must not be read as active support; use the current table above and the V2 contract below instead. The events section describes the implemented change subscription that replaced the historical stub.
+List responses are `{items,next_cursor,release_token}`. Nullable fields are explicit `null`. Initial reads can express account intent with `expected_account_username`; callers do not supply epochs, account directories or shard names.
 
-## Historical HTTP inventory
+| Resource | Parameters and result |
+|---|---|
+| Contacts | Optional `q`, `kind`, `limit=100`, `cursor`; `offset` rejected. |
+| Chats | Optional `q`, `limit=100`, `cursor`; `offset` rejected. |
+| Exact chat | Source `username`; returns `ChatV2`, or 404 `not_found`. |
+| Group members | Optional `limit=100`, `cursor`; missing room is 404. Local empty records do not establish actual membership. |
+| Chat messages | `limit=100`, `cursor`, `order=desc|asc`, optional URL-encoded JSON `include`/`exclude`; `offset` rejected. |
+| Native message | Canonical nonzero signed-i64 decimal `server_id`; optional `chat_username` narrows lookup. Invalid ID/query is 400, missing message 404, ambiguous match 409. |
+| Media | Same locator, plus `quality=best|legacy|full|standard|thumbnail`; returns `MediaResult`, including `pending` or `unsupported`. |
+| Raw voice | Same locator; returns raw SILK bytes (`audio/silk`), not the retired base64 envelope. Missing local voice source is 503 `voice_source_missing`. |
+| Snapshot release | Opaque `release_token`; returns `{released:boolean}`. Removes frozen cache data, never source messages; identity checks and the GUI guard still apply. |
 
-**Architecture decision for the proposed consolidation:** WeChat login/process state, database snapshots and their lifetime, cursor consistency, voice lookup/retrieval, GUI selection and attachment readiness belong inside this server. A downstream business application should provide account/recipient intent and consume stable results, not reconstruct this server's state machine from epoch, account directories or shard names. The inventory remains a record of today's implementation; the [boundary proposal](#proposed-upstreamdownstream-boundary) below describes changes that are **not implemented**.
+`conversation_username` is rejected rather than aliased. `MessageV2.chat_username` is the containing chat identity; nullable `ReferenceV2.chat_username` is the reference's chat identity. Native lookup scans only validated `Msg_<32 lowercase hex>` tables in the current account, binds the ID as a SQL parameter and refuses multiple matches. Media and voice use the resolved source anchor. Raw voice bytes are bounded at 32 MiB; invalid SILK data, ambiguous media sources and source changes fail rather than return unrelated bytes.
 
-Origin **U** means the route already existed in upstream revision `96c2e90`; **I** means it was added by this integration branch in `1f100e0`. This is route provenance, not a claim that every U handler is unchanged. The branch changed legacy read-error reporting in `1f100e0`, selection failure reporting in `9feec95`, and shared database/GUI helper behavior in `baf36ff`. Docker-only `1ee650b` added no API. The totals are **30 U and 8 I**, including the WebSocket registrations listed separately below.
+### Pagination and budgets
 
-Consumer entries distinguish actual CLI commands and in-repository clients from external applications. External business adapters are not part of this repository: their complete current call graph is **not verified here**. The reported integration uses the dedicated text/file endpoints, whereas the CLI uses the generic sender. This does not establish use of every other endpoint.
+Continue on the same endpoint with the opaque `cursor`. Only `next_cursor: null` is terminal, not a short page. Cursor-only requests inherit filters and order; explicitly changing `q`, `kind`, `order`, `include` or `exclude`, or changing the resource/room scope, is rejected with 409. The server does not recollect or broaden a continuation.
 
-Parameters below are path/query parameters unless marked **JSON**, **multipart**, or **header**. Extractor/auth/body-limit errors can occur before the handler and need not use its response envelope. “200 on failure” describes handler-level refusals, not malformed HTTP/JSON. Decoded media uploads are limited to 128 MiB; the global HTTP body allowance includes base64 expansion plus 1 MiB of JSON overhead (`router/mod.rs:39–42,117`).
+The limit is 1–1000 (default 100), with a 3 MiB serialized-items page ceiling. Frozen samples have an absolute 300-second TTL, four retained-sample slots, 50,000 rows/16 MiB per sample, and 32 MiB total serialized row data. Capacity exhaustion rejects new samples with 413 rather than evicting unexpired cursors. Single-page results have `release_token: null`; otherwise the token remains stable across the sample. Release after completion or abandonment. If release fails, keep successful read results and let TTL reclaim the sample; do not replay business actions.
 
-### Health, status and login
+Repeated cursors return the same frozen rows until release/expiry. Account/process/session scope changes can invalidate them; server restart loses the in-memory cache. A frozen sample is local coverage, not complete remote history or a simultaneous cross-database transaction.
 
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/health` | Process probe; none | 200 `status:ok`; not a WeChat readiness check | None | Container probe; U |
-| GET | `/api/status` | Static placeholder; none | 200, hardcoded `container:running`, `loginState.status:logged_out`, `version:0.1.0`; **not actual login state** | None | `wx status`; U |
-| GET | `/api/status/auth` | Observe login state; none | 200 `status` and optional `loggedInUser`; missing session, failed observation or an unrecognized current UI yields `unknown` without an old account identifier; a saved account alone is not proof of login | Screenshot/a11y observation; recognized states update agent DB, unknown observations do not reuse persisted login state | `wx status` / `wx auth status`; U |
-| POST | `/api/status/login` | Read the current QR screenshot; no body required | 200 `success:false`, `state`, optional `qrDataUrl`; screenshot failure reports logged out | Screenshot/QR decoding; **does not initiate the login plan** | HTTP helper; `wx auth login` instead uses login WS; U |
-| POST | `/api/status/logout` | Log out; no body required | 200 `success,error?`; no session/not logged in/UI or state-write failure is in `error` | Logout UI plan, then clears persisted login identity | `wx auth logout`; U |
+Read errors use `{error,code}`:
 
-Sources: `router/mod.rs:44–46,63–68`, `router/status.rs:26–232`; CLI commands in `packages/cli/src/cli.ts:172–221`. Real login orchestration is the login WebSocket below.
+| HTTP | Codes |
+|---|---|
+| 400 | `invalid_parameter` |
+| 404 | `not_found` |
+| 409 | `scope_changed`, `ambiguous` |
+| 410 | `expired` |
+| 413 | `budget_exceeded` |
+| 500 | `source_read_failed` |
+| 503 | `identity_unavailable`, `keys_unavailable`, `source_unavailable`, `voice_source_missing` |
+| 504 | `deadline_exceeded` |
 
-### Chats, contacts and messages
+Read rounds have an 8-second budget, including at most 2 seconds waiting for the GUI guard; collection interrupts SQL and caps decompressed content at 4 MiB per row. Missing required keys, unreadable shards and invalid rows fail the request instead of producing successful partial data. Media transfer waiting has its own policy below.
 
-The **legacy read errors** referenced here are 503 `WECHAT_SESSION_UNAVAILABLE`, 409 `WECHAT_NOT_LOGGED_IN`, 503 `WECHAT_KEYS_UNAVAILABLE`, and 500 `WECHAT_DB_READ_FAILED`, with `error` and `code`. They are not successful empty arrays. These legacy readers may extract missing keys from the running process and cache them in the agent DB; they are source-data reads, **not necessarily side-effect-free HTTP GETs**.
+### Source isolation and identity
 
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/api/chats` | List chats; `limit=50`, `offset=0` | 200 `Chat[]`; legacy read errors | Local reads; possible key extraction/cache write | `wx chats list`, shared client; U |
-| GET | `/api/chats/{id}` | One chat; required `id` | 200 `Chat` or `null`; legacy read errors | Same | `wx chats get`, shared client; U |
-| GET | `/api/chats/find` | Search; required `name` | 200 `Chat[]`; missing query rejected; legacy read errors | Same | `wx chats find`, shared client; U |
-| POST | `/api/chats/{id}/open` | Select chat; required `id`, `clearUnreads=false` | 200 `ok,username?,index?,error?`; refusal remains 200/`ok:false`; official accounts unsupported | GUI guard + selection; optional unread clearing | `wx chats open`, shared client; U |
-| GET | `/api/contacts` | List contacts; `limit=200`, `offset=0` | 200 `Contact[]`; legacy read errors | Local reads; possible key extraction/cache write | `wx contacts list`, shared client; U |
-| GET | `/api/contacts/find` | Search; required `name` | 200 `Contact[]`; missing query rejected; legacy read errors | Same | `wx contacts find`, shared client; U |
-| GET | `/api/v2/contacts` | V2 source roster; optional `q`, `kind`, `limit=100`, `cursor`, initial `expected_account_username`; `offset` is rejected | 200 `{items,next_cursor,release_token}`; nullable fields are explicit `null`; errors: 400 invalid parameter, 409 scope changed, 410 expired, 413 budget, 500 source read, 503 unavailable, 504 deadline | Isolated local database snapshots; no UI changes | V2 shared client and `wx contacts list/find`; U |
-| GET | `/api/v2/chats` | V2 chat roster; optional `q`, `limit=100`, `cursor`; `offset` is rejected | Same page envelope and V2 read errors | Isolated local database snapshots | V2 shared client and `wx chats list/find`; U |
-| GET | `/api/v2/chats/{username}` | Exact source username | 200 `ChatV2`; 404 `not_found`; V2 read errors | Isolated local database snapshots | V2 shared client and `wx chats get`; U |
-| GET | `/api/v2/chats/{username}/members` | Group membership; optional `limit=100`, `cursor`; `offset` is rejected | Same page envelope; a missing room is 404; V2 read errors | Isolated local database snapshot; local empty records do not establish actual membership | V2 shared client and `wx chats members`; U |
-| DELETE | `/api/v2/read-snapshots/{release_token}` | Release one retained frozen page sample; opaque server-issued token | 200 `{released:boolean}`; 409 scope changed, 410 expired | Removes only in-memory sample data | Shared client and CLI `--all`; U |
-| GET | `/api/v2/chats/{username}/messages` | V2 message page; `limit=100`, `cursor`, `order=desc|asc`, optional URL-encoded JSON `include` / `exclude`, initial `expected_account_username`; `offset` rejected | 200 `{items,next_cursor,release_token}` of `MessageV2`; V2 read errors, malformed filters 400, changed cursor scope 409 | Isolated cross-shard sample, filtered before page freeze | `WeChatClient.listMessagesV2`, `wx messages list`; U |
-| GET | `/api/v2/messages/{server_id}` | Exact native non-zero signed-i64 ID as canonical decimal path text; optional `chat_username`, `expected_account_username` | 200 `MessageV2`; 400 invalid ID/query, 404 not found, 409 ambiguous/scope changed, 413 budget, 500 source read, 503 unavailable, 504 deadline | Isolated parameterized lookup in current account scope | V2 shared client; U |
-| GET | `/api/v2/messages/{server_id}/media` | Exact native ID; optional `chat_username`, `expected_account_username`, and legacy `quality=best|legacy|full|standard|thumbnail` | 200 legacy `MediaResult`, including `pending`/`unsupported`; locator errors as above | Uses the located source anchor, existing cache/decrypt/best/full/pending policy and bounded native-transfer wait; no chat selection | V2 shared client; U |
-| GET | `/api/v2/messages/{server_id}/voice` | Exact native ID; optional `chat_username`, `expected_account_username` | 200 raw SILK bytes (`audio/silk`); 400 invalid ID/query, 404 message missing, 409 ambiguous/scope changed, 503 `voice_source_missing`, other non-success source errors | Reuses verified voice collector with locator-owned shard/chat/local/server/time anchor | V2 shared client; U |
-| GET | `/api/v2/message-types` | No parameters | 200 message type dictionary | Static canonical dictionary; no source access | API and CLI type label contract; U |
-| GET | `/api/messages/{chat_id}` | List messages; required `chat_id`, `limit=50`, `offset=0` | 200 `Message[]`; legacy read errors, including missing discovered-shard keys | Local reads; possible key extraction/cache write | `wx messages list`; shared client/inbound polling; U |
-| GET | `/api/messages/{chat_id}/media/{local_id}` | Retrieve media; required chat and integer local id; `quality=best`, also `legacy`, `full`, `standard`, `thumbnail` | 200 `MediaResult`; may be `pending` or `unsupported` without data; no session/not logged in returns `unsupported`; invalid quality rejected | May queue a native transfer and wait up to 20 s; possible key/cache writes; no chat selection | `wx messages media`, shared client/media consumers; U |
-| POST | `/api/messages/send` | Generic sender; **JSON** `chatId` plus `text`, `image:{data,mimeType}`, or `file:{data,filename}` | 200 `success,error?`, including handler refusals; malformed/missing required JSON fields are extractor errors | Temporary media files, clipboard/UI send under shared GUI guard; no injected identity fence | Ordinary `wx messages send`, shared client/outbound adapters; U |
+The reader copies the source database and WAL as ordinary file bytes, merges the valid committed prefix, and opens only a private encrypted copy with SQLite. It does not open the live source with SQLite, checkpoint or rewrite it, and needs no source `-shm`. Source rowids, including implicit rowids, are preserved. Invalid WAL headers fail; frame validation stops at the first invalid frame, merging only preceding valid commits. No valid committed frames does not prove there are no newer messages.
 
-Sources: `router/chats.rs:17–211`, `router/contacts.rs:14–101`, `router/messages.rs:22–88,242–548`, `ia/types.rs:349–387,412–431,541–587`. Media quality details and generic send errors appear below. Chat opening can use the plan's existing popup-dismiss action; it is not a universally side-effect-free selection probe.
+A 512 MiB per-build processing budget covers the source database, WAL, merge index and merged copy; it is not a process-wide memory limit. A source that changes during copying is refused. SQLCipher HMACs are checked as pages are read, not for every logical page up front. Unchanged file metadata and keys permit reuse of a private copy, with independent SQLite connections. This four-entry copy cache is separate from frozen pagination. Graceful shutdown clears retained copies; abrupt termination can leave private files.
 
-V2 page continuation uses the same list endpoint with `cursor`; only `next_cursor: null` is terminal, not a short page. A continuation that omits `q` or `kind` inherits those filters from the frozen cursor sample. If a continuation explicitly supplies a different value—including `q=` to clear a non-empty query—the server rejects it with 409; resource and room identity must also match. The server never recollects or broadens a cursor-only continuation. `release_token` is `null` for single-page results and otherwise stays stable across the frozen sample. The cursor and release token are opaque and expire after the server's fixed in-memory TTL. V2 `ChatV2.username` is the source identity; `last_msg_sender` and `last_sender_display_name` expose the source session sender values (empty strings normalize to `null`). `unread_count` preserves source SQL NULL as JSON `null`, and retains all integer values otherwise. No V2 endpoint falls back to a V1 response.
+Identity checks remain internal. Successful recorded login/logout writes advance a generation; process, boot, session or account-root changes also affect scope. Failed login writes block trusted identity reads until a successful write. Ordinary polling does not advance the generation. An epoch is not continuous proof of every external UI login transition. Account observation uses current UI evidence; persisted identity alone is not proof of login. Voice jobs use their separate account ownership rules below.
 
-V2 native message lookup/media/voice requests use optional `chat_username` to scope the message locator; the old `conversation_username` query key is rejected as an unknown parameter. `POST /api/v2/messages/send` requires a non-empty `chat_username` string and returns nullable `chat_username` in its result; the old request key is rejected (`400 invalid_parameter`) rather than aliased. `ReferenceV2.chat_username` is nullable and is the only serialized reference chat-name key. `MessageV2.chat_username` remains the required identity for the containing message.
+### Message fields and filters
 
-Message V2 filters use `include=[{"type":49,"sub_type":6}]` and `exclude=[{"type":10000}]` as URL-encoded JSON arrays. An omitted `include` means all types; `include=[]` means none. Entries within a list are ORed, include/exclude dimensions are ANDed, and exclusion wins. A sub-type requires a type and matches only that type; unknown non-negative u32 codes are accepted and preserved. Cursor-only continuation inherits `order` and filters; explicitly changed order/include/exclude gets 409. The CLI `--config` JSON file accepts only the `include` and `exclude` arrays. Type labels come from the canonical `packages/agent-server-rust/src/message-type-dictionary.json`, also compiled into the Docker Rust source context and transformed by `scripts/generate-types.sh` for the shared/CLI module. Namespaces `main`, `appmsg`, and `forwarded_inner` are separate; each entry has numeric `code`, stable English `key`, Chinese `label`, and `basis` (`default_adopted` or `local_observed`). Unknown numbers remain numeric and are rendered as unknown, never coerced to text.
+`ChatV2.username` is the source identity. `last_msg_sender` and `last_sender_display_name` preserve source session sender values, normalizing empty strings to `null`. `unread_count` preserves SQL NULL as JSON `null` and otherwise retains source integers.
 
-`MessageV2.server_id`, `local_id`, and `raw_type` are decimal strings (zero/missing message IDs are `null`); `type` and `sub_type` are the low/high u32 portions of the stored i64 bit pattern. `timestamp` retains the valid RFC3339 value produced from source `create_time`. In V2 frozen message collection, a missing or non-integer `create_time` rejects the row before projection; it does not produce a successful message with a null timestamp. An integer outside Chrono's representable range follows the existing collector path that yields an empty timestamp, which the V2 projection emits as `null`. The legacy message projection is unchanged. The `raw_content` field remains the frozen sample's opaque retained hex representation; it is not decoded business XML. Required `raw_content_compression` is the original row's boolean compression flag and must be paired with those bytes; callers must not infer it from decoded content or a missing value. `content` keeps the legacy clean/display behavior. `xml_sub_type` is decoded independently from the source XML and can differ from packed `sub_type`; neither value rewrites the other. `reference` preserves `svrid` as source text (including `"0"`), the referenced chat identity, the referenced `chatusr`, and the stored `displayname` separately. In group references, `fromusr` supplies the chat identity; in direct chats the current chat context supplies the chat, while a missing `chatusr` remains missing. No author is inferred from a display name or `fromusr`.
+Filters use `include=[{"type":49,"sub_type":6}]` and `exclude=[{"type":10000}]` as URL-encoded JSON arrays. Omitted `include` means all types; `include=[]` means none. Entries within a list are ORed, the two dimensions are ANDed, and exclusion wins. A sub-type requires a type. Unknown non-negative u32 codes are accepted and preserved. CLI `--config` accepts only `include` and `exclude` arrays.
 
-For app-message subtype 19, `forwarded_record` contains ordered `items` with `datatype`, `dataid`, `datadesc`, source display fields and lexical time/message-ID strings. `dataitem_source_hash_username` is only the source hash value, not an addressable username. `parse_status` is `complete`, `truncated`, or `invalid`; a truncated item-count/text limit retains only the complete prefix, while malformed XML returns no items. The parser accepts only the bounded message-record XML subset: at most 4 MiB after decode, nesting depth 16, 20,000 XML nodes/events, 100 entries, and 64 KiB per entry description. It rejects DTD/entity declarations and does not resolve external resources. This is not a general-purpose XML parser; unfamiliar XML shapes may report `invalid`. No nested messages are scheduled, no source URLs are fetched, and forwarding fields do not change `content`, media policy, or send behavior. The CLI JSON output retains the full snake_case V2 fields; readable output labels the inner type without treating it as an outer message type.
+The canonical dictionary is `packages/agent-server-rust/src/message-type-dictionary.json`, also generated into the shared/CLI module. Namespaces `main`, `appmsg` and `forwarded_inner` are separate; each entry has numeric `code`, English `key`, Chinese `label`, and `basis` (`default_adopted` or `local_observed`). Unknown codes remain numeric, not coerced to text.
 
-Native lookup scans only validated `Msg_<32 lowercase hex>` tables in the currently captured account scope, binds the ID as a SQL parameter, and refuses multiple matches. Media and raw voice use that exact internal source anchor; callers never supply shard/local ID/epoch. Existing local-ID media and send routes remain available and unchanged. The CLI supports native media via `wx messages media <chatId> --server-id <id>` while retaining the existing positional local-ID form; raw voice has no CLI input/command in this change and no send route was added.
+`MessageV2.server_id`, `local_id` and `raw_type` are decimal strings (zero/missing message IDs are `null`); `type` and `sub_type` are the low/high u32 portions of the stored i64 bit pattern. `timestamp` comes from `create_time`: missing/non-integer values fail frozen collection; out-of-range integers follow the collector's empty timestamp path and become `null` in V2.
 
-### Sessions and debug
+`raw_content` is opaque retained hex, not decoded XML. Required `raw_content_compression` is the source boolean flag and must accompany those bytes. `content` retains clean/display behavior. Independently decoded `xml_sub_type` may differ from packed `sub_type`; neither rewrites the other. `reference` preserves `svrid` as source text (including `"0"`), chat identity, `chatusr` and `displayname` separately. Group `fromusr` supplies the reference chat; direct chats use current chat context. Missing `chatusr` remains missing; no author is inferred from display names or `fromusr`.
 
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/api/sessions` | List sessions; none | 200 `Session[]` | Read agent DB | `wx session list`; U |
-| POST | `/api/sessions` | Create session; **JSON** required `name` | 200 `Session` or `error`; missing body field is an extractor error | Allocate display/port, invoke `useradd -m`, create session record | `wx session create`; U |
-| GET | `/api/sessions/{id}` | Required id **or name** | 200 `Session` or `null` | Read agent DB | Shared client `getSession`; U |
-| POST | `/api/sessions/{id}/start` | Required id or name | 200 `Session` or `error` | Start display/D-Bus/accessibility/VNC/WeChat processes; update session state | `wx session start`; U |
-| POST | `/api/sessions/{id}/stop` | Required id or name | 200 `Session` or `error` | Stop the session user's processes, clean X locks, update status | `wx session stop`; U |
-| DELETE | `/api/sessions/{id}` | Required id or name | 200 `success:true` or `error` | **Destructive**: stop if running, delete associated DB records, remove system user with `userdel -r` | `wx session delete`; U |
-| GET | `/api/debug/screenshot` | Screenshot; none | 200 `base64`; failure can be an empty string | Capture screenshot | `wx screenshot`; U |
-| GET | `/api/debug/a11y` | Accessibility observation; `format=json` or `aria` | 200 `tree` or `aria`; failure is 200 with `error` | Read accessibility tree | `wx a11y`; U |
+For app-message subtype 19, `forwarded_record.items` preserves order, `datatype`, `dataid`, `datadesc`, source display fields and lexical time/message-ID strings. `dataitem_source_hash_username` is a hash, not an addressable username. `parse_status` is `complete`, `truncated` or `invalid`; truncation retains a complete prefix, malformed XML returns no items. Limits: 4 MiB decoded XML, depth 16, 20,000 nodes/events, 100 entries and 64 KiB per description. DTD/entity declarations are rejected; external resources are not resolved. Unfamiliar shapes may be invalid. No nested messages are scheduled or URLs fetched; these fields do not alter content, media or sends. CLI JSON keeps the snake_case V2 fields and readable output distinguishes inner and outer types.
 
-Sources: `router/sessions.rs:7–46`, `sessions/manager.rs:29,49–108,143–297`, `router/debug.rs:13–67`. Session responses describe server-side sessions; they are not substitutes for the captured account identity from `/api/read/identity`.
+## Synchronous sending
 
-### Voice jobs
+`POST /api/v2/messages/send` accepts nonempty `chat_username`, optional `expected_account_username`, and these payload fields:
 
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| POST | `/api/messages/voice` | Create outgoing voice job; **multipart** required `chatId`, `audio`; **header** required `Idempotency-Key` (1–200 characters, no controls); no epoch parameter | New job 202; matching account/key/payload replays status with 200; key reused for different destination/audio 409; not logged in 409; malformed/duplicate fields 400; empty/oversized audio 413; storage failure 500 | Store audio/job state, queue worker, later take GUI guard and record/send voice chunks | `wx messages send --voice`, shared client and voice-enabled outbound adapter; U |
-| GET | `/api/messages/voice/{job_id}` | Read job; required UUID job id | 200 status object; invalid/missing/unreadable job or another account's job 404 | Read stored job status | `wx messages voice status`, shared client/polling; U |
-| POST | `/api/messages/voice/{job_id}/cancel` | Request cancellation; required UUID job id; no body required | 202 with current status, **not proof cancellation finished**; inaccessible job 404; already terminal 409 with job; write failure 500 | Write cancellation marker; previously sent chunks are not recalled | `wx messages voice cancel`, shared client; U |
+- `text`: nonempty string.
+- `image`: `{data,mime_type}` with base64 data and `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+- `file`: `{filename,data,sha256,size}` with a single basename, base64 data, lowercase SHA-256 and decoded byte count.
 
-The status object includes `jobId,chatId,accountId,status,sourceDurationSeconds,chunks,error`; preserve per-chunk results and `needs_review`. Idempotency is scoped by account and compares a hash of destination plus audio (`router/voice.rs:58–218`). Before recording, the job holds the shared GUI guard, compares the persisted logged-in account, selects the destination and checks the returned native identifier (`router/voice.rs:265–298`). This is **not** the `expectedEpoch`/`LiveSendFence` path. Status/cancel ownership uses the persisted current account (`router/voice.rs:39–44,323–359`). A restart marks interrupted jobs failed or `needs_review` rather than resending them (`router/voice.rs:362–392`).
+Unknown fields are rejected. One payload is selected by **file > image > text**; other supplied fields are reported in `ignored_fields`. Supplied JSON shapes must be valid, but only selected bytes are decoded/verified. An invalid selected payload never falls back to another field. Files must match the declared digest/size and 128 MiB decoded limit; filenames reject separators, control bytes, `.` and `..`.
 
-### noVNC static HTTP resources
+The result reports `success`, `account_username`, `chat_username`, `selected_payload`, `ignored_fields`, `commit_attempted`, `ui_confirmed`, `error_code` and `failure_stage`; file results also report accepted `payload_sha256` and `payload_size`. Preflight errors use non-success HTTP statuses; execution refusals can return HTTP 200 with failure fields. Authentication, malformed JSON and outer body-limit errors need not use this envelope.
 
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/vnc/` | Viewer landing page; optional `token`, `autoconnect=true` or `1` | HTML login prompt without token; noVNC HTML with token; missing viewer file 404; static route does not itself validate token | Serve HTML; actual connection authenticates separately | Browser/noVNC; U |
-| GET | `/vnc/{*path}` | Static viewer assets; required asset path | Asset bytes with content type; missing file 404; path containing `..` rejected with 403 | Read static files | Browser/noVNC; U |
+Sending holds the shared GUI guard, verifies account and selected destination, and rechecks them before Return. Uploads are staged privately with preserved basenames and the trusted session user's ownership. File/image preparation requires an empty composer, successful bounded paste and a fresh readiness observation before committing. Occupied input is refused, not cleared. The UTF-8 launcher/paste helper preserves staged filenames; a helper exit is not delivery proof.
 
-Sources: `router/vnc.rs:69–158`. The shipped VNC backend is read-only by default; this is a backend setting, not a guarantee made by the WebSocket proxy itself.
+Preserve commit facts even on errors. `ui_confirmed` does not prove recipient delivery; reconcile newly observed outgoing messages against a pre-send baseline. Do not automatically repeat a timed-out or uncertain send. This synchronous endpoint has no idempotency key. Outgoing voice uses the separate job API.
 
-### Integration-added send endpoints
+## Media quality
 
-| Method | Path | Purpose and required parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|---------------------------------|-----------------------------|---------|------------------|
-| POST | `/api/send/text` | Text only; **JSON** `chatId,text,expectedEpoch`; unknown fields rejected | Execution: 200 `success,accountId,epoch,chatId,commitAttempted,uiConfirmed,errorCode?`; pre-checks 400 `invalid_parameter`, 409 `scope_changed`, or 503 identity/login/target/deadline failure | GUI selection, input and Return under shared guard with identity rechecks | Reported external adapter; not ordinary CLI; I |
-| POST | `/api/send/file` | One file; **JSON** `chatId,expectedEpoch,filename,data,sha256,size`; unknown fields rejected | Execution: text response plus `payloadSha256,payloadSize`; pre-checks 400 invalid parameter/name/encoding or payload mismatch, 413 too large, 500 temp storage failure, 409 scope change, 503 identity/login/target/deadline failure | Validate/decode/stage upload; GUI preparation and Return under shared guard with identity rechecks | Reported external adapter; not ordinary CLI; I |
+For image media, `quality=full` requires the original copy, `standard` requires the mid-size copy, and `thumbnail` requests the preview. Omitted quality defaults to `best`: return the best valid local copy, requesting native full-size transfer only when the message advertises an Original. Wait up to 20 seconds before returning the best cached fallback; the response `quality` labels `full`, `standard` or `thumbnail`.
 
-Sources: `router/send_text.rs:72–198,398–476`, `router/send_file.rs:118–211,573–697`. Detailed comparison and refusal semantics are below. Frozen-read endpoints are inventoried in the local-read section.
+A regular phone send may advertise only a standard image. Opening its chat separately can make WeChat cache it; the media endpoint never selects a chat. Without that copy, `best` can return a thumbnail while strict `standard` has no image bytes. Pending results require bounded retries; disconnecting HTTP does not cancel an already submitted server-owned transfer. Raw message XML is not a retrieved attachment.
 
-## WebSocket inventory
+## Sessions and diagnostics
 
-These three entries are HTTP GET upgrades, counted separately from the 35 ordinary HTTP endpoints. All require authentication; `token` query authentication is available for browser clients.
+Session creation takes JSON `name`, allocates display/port and invokes `useradd -m`. Session lookup accepts ID or name and returns a session or `null`. Starting launches display, D-Bus, accessibility, VNC and WeChat; stopping terminates session-user processes and cleans X locks. Deleting a session additionally removes records and runs `userdel -r`: it is destructive. Handler refusals can use a 200 response containing `error`; sessions are not substitutes for `/api/v2/account` observations.
 
-| Upgrade | Path | Parameters and messages | Actual behavior / failure | Effects; consumer; origin |
-|---------|------|-------------------------|---------------------------|--------------------------|
-| GET → WS | `/api/ws/login` | `timeoutMs=300000`, `newAccount=false`; emits status, QR, phone-confirm, success, timeout or error events | Starts `LoginPlan`; bridges its emitted events through a channel; missing session emits error; timeout/disconnect cancels execution | **Active login UI flow** under GUI guard, login-state writes and possible key extraction/storage; not merely passive subscription; `wx auth login`/shared client; U |
-| GET → WS | `/api/ws/events` | No subscription parameters; emits `{"type":"data_changed"}` | Requires authentication before upgrade; missing/invalid credentials return HTTP 401 `{"error":"Unauthorized"}`. Publishes a broad invalidation hint for message `.db`/`.db-wal` file changes; `.db-shm` is excluded. The first change starts a bounded 300 ms coalescing window; later changes do not extend it. No message identity, body, cursor, acknowledgement, or replay is included. | Local watcher observes source-file changes without querying message SQL; shared client can reconnect but does not read messages; existing U route with implemented change notifications |
-| GET → WS | `/vnc/websockify` | Supports `binary` subprotocol; token/header authentication | Bidirectional proxy to local websockify; upstream connection failure ends handler | Opens VNC transport; browser/noVNC; U |
+`/api/debug/screenshot` returns `base64` (possibly empty on failure). `/api/debug/a11y?format=json|aria` returns `tree` or `aria`, or a 200 response with `error`.
 
-Sources: `router/status.rs:234–368,379` onward (real login producer and channel consumer), `plans/login.rs:266–286,374` onward, `router/events.rs`, `tools/wechat_events.rs`, `docker/tools/watch-wechat-data.py`, and `router/vnc.rs:8–66`. There is no registered SSE `/api/events/subscribe` endpoint.
+## Voice jobs
 
-Treat `data_changed` as a hint, not a reliable event history: notifications can be missed, and there is no replay after reconnect. A consumer should perform its own catch-up read at startup and after reconnect; `subscribeChanges` itself only yields events. Consumer integration and its acceptance checks are separate from this API contract. Archive all message types independently of include/exclude filters used later to select automated execution.
+Create with multipart `chatId` and `audio`, plus `Idempotency-Key` (1–200 characters, no controls). A new job returns 202; the same account/key/payload replays status with 200. Reusing the key for different destination/audio returns 409; malformed fields return 400, empty/oversized audio 413, storage failure 500, and not logged in 409.
 
-## Send API comparison
+Status includes `jobId,chatId,accountId,status,sourceDurationSeconds,chunks,error`. Preserve per-chunk results and `needs_review`. Status lookup requires a UUID; invalid, missing, unreadable or another account's job returns 404. Cancel returns 202 with current status, not proof cancellation finished; terminal jobs return 409. Previously sent chunks are not recalled.
 
-These are three existing entry points, not three levels of delivery confirmation. `chatId` is the **recipient** identifier; the response's `accountId` describes the captured **sender account storage identity**. They must not be substituted for one another. In particular, this `accountId` is derived from the account directory, not independently read as a UI-proven wxid (`tools/wechat_read_identity.rs:413–438`).
+Before recording, the worker takes the shared GUI guard, compares the persisted logged-in account, selects the destination and checks its returned native identifier. Ownership uses the persisted current account, not the synchronous sender's epoch fence. A restart marks interrupted work failed or `needs_review` rather than resending it. See `router/voice.rs` for the job contract.
 
-| Property | `/api/messages/send` | `/api/send/text` | `/api/send/file` |
-|----------|----------------------|------------------|------------------|
-| Method and input | POST; `chatId` plus `text`, `image:{data,mimeType}`, or `file:{data,filename}` | POST; `chatId,text,expectedEpoch` | POST; `chatId,expectedEpoch,filename,data,sha256,size` |
-| Entry-point origin | Existing upstream route | Added in `1f100e0` | Added in `1f100e0` |
-| CLI use | Ordinary text/image/file `wx messages send` uses this route | Not the ordinary CLI send route | Not the ordinary CLI file-send route |
-| GUI serialization | Shared GUI guard around the execution plan | Same guard, also spanning account pre-checks and post-checks | Same guard, also spanning account pre-checks and post-checks |
-| Caller epoch | None | Required; current account/process/session epoch must match | Required; current account/process/session epoch must match |
-| Immediately before Return | No injected `SendFence` | Account epoch and current native chat identifier rechecked | Same identity checks, plus prepared-file readiness |
-| File preparation | Paste helper, wait, Return in one action sequence; helper failure is not checked by this legacy branch | Not supported | Empty composer, successful bounded paste, then a fresh observation before Return |
-| Upload digest and size | Server decodes and bounds media; no caller digest/size fields | Not applicable | Caller SHA-256 and size must match the decoded bytes |
-| Handler execution response | `success,error?` | `success,accountId,epoch,chatId,commitAttempted,uiConfirmed,errorCode?` | Same plus `payloadSha256,payloadSize` |
-| Delivery proof / idempotency | Neither provided | Neither provided | Neither provided |
+## WebSockets and VNC
 
-Sources: `router/messages.rs:387–548`, `router/send_text.rs:146–198,297–311,398–476`, `router/send_file.rs:188–365,600–697`, `plans/send_message.rs:1325–1461`, and `execution/mod.rs:61–82`. The shared TypeScript client's `sendMessage` uses the legacy endpoint (`packages/shared/src/client.ts:207–208`). In particular, the CLI's success does not exercise the dedicated file endpoint's additional readiness checks.
+All three upgrades require authentication; browser clients may use the `token` query parameter.
 
-### What the extra fields actually establish
+| Path | Parameters and behavior |
+|---|---|
+| `/api/ws/login` | `timeoutMs=300000`, `newAccount=false`. Starts `LoginPlan` under the GUI guard; emits status, QR, phone-confirm, success, timeout/error events. Disconnect/timeout cancels execution. This is active login with identity writes and possible key extraction, not a passive subscription. |
+| `/api/ws/events` | Emits only `{"type":"data_changed"}`. Watches message `.db`/`.db-wal` changes, excludes `.db-shm`, and coalesces from the first change in a bounded 300 ms window. No message identity/body, cursor, acknowledgement or replay. The watcher does not query message SQL. |
+| `/vnc/websockify` | Bidirectional authenticated proxy to local websockify; supports `binary` subprotocol. Upstream connection failure ends the handler. |
 
-| Field or check | Fact checked today | What it does not establish |
-|----------------|--------------------|-----------------------------|
-| Current account identity | Which account is represented by the chosen identity source; today's `accountId` is storage-derived | A separate UI-proof of login, or whether the process/session is the same generation as an earlier observation |
-| Native current chat identifier versus `chatId` | Which chat is selected | Sender identity, upload integrity, or delivery |
-| `expectedEpoch` | Whether the caller's earlier identity scope still matches the server's current scope | Recipient permission or a requirement that a queued send must be cancelled after every same-account re-login |
-| `sha256` | Decoded upload bytes match the caller-supplied digest | Approval, recipient identity, or receipt by WeChat/the recipient |
-| `size` | Decoded byte count matches the caller-supplied count | Anything about which file the caller intended, beyond that length |
-| Empty composer / paste result / enabled Send | Local preparation observations | Correct destination or delivery; these are separate from identity checks |
+Treat `data_changed` as an invalidation hint: catch up at startup and after reconnect. Shared `subscribeChanges` only yields events; it does not read messages. There is no registered SSE `/api/events/subscribe` endpoint.
 
-The server can compute size and SHA-256 itself. Caller-supplied values add an independent business check only when tied to an independently approved artifact; values computed from the same bytes immediately before upload mainly check request self-consistency. Neither replaces the other as a byte-level check, and neither replaces account/chat identity checks.
-
-**Decision notes, not implemented changes:** the proposed unified API validates the intended sender wxid and current recipient internally without requiring a caller-supplied epoch. Keeping internal checks across a single operation is separate from requiring the caller's previous generation token. No business requirement established by this API audit says that a queued send must be rejected solely because the same account logged in again. The same boundary applies to reads: downstream callers pass opaque cursors/media handles, rather than epoch/account-directory/shard details. The epoch inventory below distinguishes current behavior from the proposed internal responsibility. None of these alternatives has been implemented by this documentation update.
-
-The dedicated file endpoint's `target_changed` is not limited to an actual recipient change: its plan also uses that code when the pane/composer preparation check fails **before** consulting the identity fence (`SendMessagePhase::ReadyToCommit` in `plans/send_message.rs`). Removing `expectedEpoch` alone therefore does not address every file-send refusal with that code. A caller that discards `commitAttempted` cannot reconstruct it from the error code later.
-
-### File-name handling
-
-Both CLI and dedicated file requests carry a basename, but the handlers stage it differently. The legacy route replaces non-ASCII characters and prefixes the temporary filename with a timestamp. The dedicated route validates the basename and preserves it inside a private upload directory owned by the session's operating-system user.
-
-The common `docker/tools/launch-wechat` launcher sets `LANG`, `LC_ALL` and `LC_CTYPE` to `C.UTF-8`. With this startup environment, `docker/tools/paste-file` pastes the original file URI without creating a renamed alias. Dedicated uploads retain their staged basename through clipboard preparation; the legacy route's own filename rewriting remains unchanged. A successful helper exit alone does not confirm that WeChat accepted or sent the attachment.
-
-## Local-read contracts
-
-Chat, contact and message-list reads (including chat/contact search and single-chat lookup) return `{"error":"CODE","code":"CODE"}` when a read cannot be completed:
-
-| HTTP status | Code |
-|-------------|------|
-| `503` | `WECHAT_SESSION_UNAVAILABLE` |
-| `409` | `WECHAT_NOT_LOGGED_IN` |
-| `503` | `WECHAT_KEYS_UNAVAILABLE` |
-| `500` | `WECHAT_DB_READ_FAILED` |
-
-Successful responses keep their array or single-chat object/`null` shape. A failed candidate-database lookup or a missing key for a discovered message database fails the request instead of silently skipping that source. An empty array is not proof of complete history; pagination and source coverage still apply. Media reads retain the media-specific results described below.
-
-Database reads are source-isolated: the reader copies the database file and its write-ahead log as ordinary file bytes, merges the valid committed prefix, and opens only a private encrypted copy with SQLite. The live client database is therefore never opened by SQLite, locked, checkpointed or rewritten by this read path, and the read needs no source `-shm`. Every rowid is the source's, including implicit rowids of tables without a primary key. Invalid WAL headers fail the read; frame validation stops at the first invalid frame, and only commits in the preceding valid prefix are merged. A copy with no valid committed frames is not proof that the client has no newer messages. A read whose database, write-ahead log, merge index and merged copy together would exceed 512 MiB is refused rather than read, and a source that changes while it is being copied is refused rather than returned half-updated. This is a per-build processing budget, not a process-wide memory limit. This path verifies a page's SQLCipher HMAC when the page is read; it does not authenticate every logical page up front.
-
-Unchanged database/WAL file metadata and the same key allow reuse of a private encrypted copy; each caller opens an independent SQLite connection. The four-entry source-copy cache is separate from the frozen pagination samples below. Graceful shutdown clears retained copies, while abrupt termination can leave private files; this does not provide incremental WAL updates or remove other processes' files.
-
-### Frozen local reads
-
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/api/read/identity` | Capture identity; no `expectedEpoch` required | 200 `accountId,accountDir,epoch,evidence:process_session`; 503 identity unavailable/login unverified; 504 deadline | GUI guard, agent DB and process observations; no frozen-cache entry | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-| GET | `/api/read/messages/{chat_id}` | Freeze/read message sample; required chat id and `expectedEpoch`; first page `limit=100` (1–1000), subsequent page `cursor` instead of limit | 200 page envelope below; read errors below | First page collects local data and may retain a frozen sample; subsequent pages reuse rows but still recapture identity | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-| DELETE | `/api/read/messages/{chat_id}/snapshots/{snapshot_id}` | Release scoped cache; required chat id, snapshot id, `expectedEpoch`; no limit/cursor | 200 `released:boolean`; missing cache returns false; malformed id 400, wrong scope 409, identity/deadline failures | Deletes only in-memory sample/cursors; never source messages | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-| GET | `/api/read/contacts` | Freeze/read contact roster; required `expectedEpoch`; first page `limit=100` (1–1000), subsequent `cursor` instead of limit | 200 same page envelope; read errors below | Read contact DB, retain/reuse in-memory roster and recapture identity | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-| DELETE | `/api/read/contacts/snapshots/{snapshot_id}` | Release roster cache; required snapshot id and `expectedEpoch`; no limit/cursor | 200 `released:boolean`; missing cache false; malformed id 400, wrong scope 409, identity/deadline failures | Deletes only in-memory roster/cursors | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-
-Sources: `router/read.rs:1191–1380,1515–1599`. Recognized duplicate parameters, an empty epoch, or limit together with cursor are rejected; unrecognized query parameters are currently ignored (`router/read.rs:794–908`). In particular, `offset` is **not pagination** for these routes. All retain the GUI guard during their identity-sensitive operation but do not perform GUI actions or initiate key extraction.
-
-Pages return `{items,nextCursor,total,snapshotId,accountId,accountDir,epoch,coverage:"frozen_source_scan"}`. `total` counts the frozen local sample, not remote history or a simultaneous cross-database snapshot. Message rows retain `sourceShard`, original `rawType`, and hex `rawContent`; `isSelf` remains a heuristic. Process/session epochs do not detect every external UI logout/login between observations.
-
-The contact roster shares that envelope and these error codes, but its scope is fixed and independent of any chat: a roster cursor cannot read a message sample and a message cursor cannot read the roster. Each roster item is exactly five string fields — `username`, `remark`, `nick_name`, `alias`, `display_name` — read from `contact.db` (`WHERE delete_flag = 0`, `alias` only when the live schema has it). It does not filter by `local_type`, `@chatroom`, or a system-username list, so contacts the older chat/contact listings drop are still listed; `display_name` is the trimmed remark, else the trimmed nickname. It grants no contact permission. Missing or unreadable required columns, a repeated `username`, and an over-budget sample fail the request instead of returning a partial or empty roster.
-
-The first-page limit is 1–1000 (default 100). Pages also have a 3 MiB serialized-items ceiling, so a short page is not terminal: follow `nextCursor` until null. Cursors replay identically until explicit release or the absolute 300-second TTL. Budgets: four retained snapshots, 50,000 rows/16 MiB per sample, 32 MiB total serialized row data; single-page samples need no retained cursor cache. Capacity exhaustion rejects new snapshots with `413` instead of evicting unexpired cursors. Release after completion or abandonment. If release fails, retain the successful read result and let TTL reclaim the cache; do not replay business actions.
-
-Errors use `{error,code}`: `400 invalid_parameter`, `409 scope_changed`, `410 frozen_expired`, `413 budget_exceeded`, `500 source_read_failed`, `503 identity_unavailable/keys_unavailable/source_unavailable/login_unverified`, or `504 deadline_exceeded`. Requests have an 8-second round budget, including at most 2 seconds waiting for the UI guard; collection interrupts SQL and caps decompressed content at 4 MiB per row. Missing keys, unreadable shards and invalid rows fail the request rather than return partial data. An unverified login write blocks identity reads until a successful login-state write advances the generation. These endpoints do not initiate key extraction or UI actions.
-
-### Raw voice read
-
-| Method | Path | Purpose and parameters | Response / failure behavior | Effects | Consumer; origin |
-|--------|------|------------------------|-----------------------------|---------|------------------|
-| GET | `/api/read/voice` | Read stored voice; required `expectedEpoch,chat,sourceShard,localId,serverId,created`; shard must be a `message_N.db` basename, local id positive, server id nonzero | 200 raw SILK envelope below; 400/409/413/500/503/504 as detailed below | Source-data read under GUI guard; no GUI action, new key extraction, pagination or frozen-cache entry | Direct HTTP; not ordinary CLI; external per-endpoint use not audited here; I |
-
-Sources: `router/read.rs:918–1007,1401–1511,1592`.
-
-`chat`/`localId`/`serverId`/`created` name one message and `sourceShard` is a `message_N.db` basename; the route resolves no other shard and reads no frozen page. A successful response is `{accountId,accountDir,epoch,chat,sourceShard,localId,serverId,created,mediaShard,mediaRowId,mediaOwnerId,format:"silk",encoding:"silk-v3",bytes,sha256,data}`: `localId` is the message shard's own id, `mediaRowId`/`mediaOwnerId` are the media shard's row and chat-mapping ids, `sha256` is the lowercase hex digest of `data`, and `data` is standard base64 of the raw SILK bytes. The raw bytes are bounded at 32 MiB (about 43 MiB encoded) and do not inherit the pages' 3 MiB/4 MiB limits. This is a raw authenticated WeChat read capability: it attests the captured process/session epoch, canonical account and stored-key fences, not the note's direction or any business authorization. Errors reuse `{error,code}`: a missing media row is `503 voice_source_missing` (retryable, not proven permanently absent), multiple matches are `409 voice_source_ambiguous`, a missing/contradictory message or a source that moved is `409 scope_changed`, a broken row or invalid SILK payload is `500 source_read_failed`, over 32 MiB is `413 budget_exceeded`, and the shared `400`/`503`/`504` codes apply as above.
-
-### Fenced text send
-
-`POST /api/send/text` accepts only `{chatId,text,expectedEpoch}`. It holds the shared UI guard and rechecks the account epoch and selected chat before dispatching Return. Text and epoch must be nonempty; image/file fields are rejected.
-
-The execution response is `{success,accountId,epoch,chatId,commitAttempted,uiConfirmed,errorCode?}`. A refusal after the pre-checks reports `200` with `errorCode` `chat_not_open` (the focus round did not observe an open chat, which is not attributable to a single cause), `chat_selection_failed` (the chat selection helper did not answer with success), `scope_changed`/`target_changed`/`composer_not_empty`/`paste_failed`, `aborted`, `timeout`, `execution_failed` or `commit_unconfirmed`. HTTP 200 or `uiConfirmed` alone does not prove a new message or recipient delivery: reconcile newly observed outgoing records against a pre-send baseline. After a timeout or uncertain commit, do not automatically repeat the POST. This endpoint does not provide an idempotency key.
-
-### Fenced file send
-
-`POST /api/send/file` accepts only `{chatId,expectedEpoch,filename,data,sha256,size}`: one file, no caption, no host path or image field. `data` is standard base64, `sha256` is a lowercase 64-character hex digest, and `size` is the exact decoded byte count. `filename` must be a single basename (no `/` or `\`, no control byte, not `.` or `..`); the original name is preserved at staging and by the paste helper. The decoded bytes must not exceed the 128 MiB upload limit and must match both `size` and `sha256` before any client work starts.
-
-The file is staged in an exclusive `0700` directory as a `0600` `create_new` file owned by the trusted session's login user (resolved from `/etc/passwd`, never from the request) so the WeChat user can read it, and removed on every path. A missing session or unmapped login user is refused before staging; owner-setting failure is a pre-commit `temp_storage_failed` and its own staged paths are cleaned up. Before pasting, the run requires an empty composer — an editable field whose accessibility helper reports the derived `TEXT_EMPTY` state (the AT-SPI Text character count, never the field's label) with a disabled Send control — and records that baseline; an occupied composer is refused with `composer_not_empty` and is never cleared. The paste runs on the fenced session's display with a bounded deadline and must exit zero, otherwise the run is refused with `paste_failed` and nothing is committed; the attachment is committed by a separate Return step only after the baseline, the successful paste, the live readiness, and the account epoch plus selected chat all still hold. Sending holds the shared UI guard, and dropping the request cancels an uncommitted run before Return.
-
-The response is `{success,accountId,epoch,chatId,commitAttempted,uiConfirmed,errorCode?,payloadSha256,payloadSize}`. Pre-check failures use `400 invalid_parameter`/`invalid_filename`/`invalid_encoding`/`payload_mismatch`, `413 payload_too_large`, `500 temp_storage_failed`, `409 scope_changed` or `503 identity_unavailable`/`not_logged_in`/`login_unverified`/`target_unavailable`/`deadline_exceeded`; execution/post-check refusals report `200` with `errorCode` `composer_not_empty`/`paste_failed`/`target_changed`/`scope_changed`/`identity_unavailable`/`chat_not_open`/`chat_selection_failed`/`aborted`/`timeout`/`execution_failed`/`commit_unconfirmed`. `payloadSha256` and `payloadSize` attest only the accepted upload, not delivery, and neither the staged file's deletion nor `uiConfirmed` proves the client read the bytes; reconcile outgoing records and never auto-repeat an uncertain commit.
-
-## Media quality and generic-send details
-
-For image media, `?quality=full` requires the original-resolution copy,
-`?quality=standard` requires the mid-size copy, and `?quality=thumbnail`
-requests the preview. `?quality=best` returns the best valid local copy.
-When the message advertises an Original image, it requests the native full-size
-transfer and waits up to 20 seconds before returning the best cached fallback.
-Its `quality` response field is `full`, `standard`, or `thumbnail`. A regular
-phone send may advertise only a standard image; opening its chat can make
-WeChat cache that copy. The media endpoint does not open chats itself. Without
-the standard copy, `best` returns a thumbnail and strict `standard` has no
-image data yet. Omitting `quality` now uses `best`; pass `quality=full` to
-require the original-resolution copy.
-
-`POST /api/messages/send` is unfenced and returns `{success,error?}`. It reports
-what it observed without remapping it: `NOT_LOGGED_IN` for a login refusal,
-`No session available` when there is no session, `No text, image, or file
-provided` for an empty body, and otherwise the run's own error — which is
-`chat_not_open` or `chat_selection_failed` when the send stopped waiting for an
-open chat or for a successful chat selection, and the historical text
-(`No action selected`, `Aborted`, `Execution timeout after Ns`,
-`Unknown state for Ns - no matching IAState found`, `Max steps reached`)
-otherwise.
-
-The legacy JSON shape does not enforce mutual exclusion of text/image/file: use one kind rather than relying on the plan's branch priority. File base64/write failures return `success:false`; image decode/write failures can instead leave no image path and fall through into the plan (`router/messages.rs:434–511`). The Rust `SendResult` contains no `messageId` (`ia/types.rs:541–546`), even if a client-side convenience type suggests one. These details are current behavior, not a recommended new result contract.
-
-## Epoch inventory and simplification decisions
-
-### What changes an epoch
-
-This epoch is a 64-character SHA-256 digest, **not a Unix timestamp, authentication token, permission generation, or message version**. It was introduced with the reliable-read/dedicated-send APIs in `1f100e0`; it is not a parameter of every endpoint.
-
-`epoch_of` hashes a domain separator followed by seven NUL-separated fields: `login_generation`, canonical session row id, WeChat process PID, process start tick, boot id, account-directory name, and full database-root path (`tools/wechat_read_identity.rs:440–470`). The server's own PID is not one of these fields.
-
-| Event or fact | Implemented effect | Evidence |
-|---------------|--------------------|----------|
-| Successful login-identity write, even the same account value | Increments `sessions.login_generation`; therefore changes epoch | `db/queries.rs:611–712`, specifically `674–691` |
-| Successful logout-identity write | Also increments generation; logged-out state cannot yield a usable logged-in identity | `router/status.rs:185–199`; same writer |
-| Login write fails or cannot be verified | Quarantine marker blocks trusted identity capture, typically 503 `login_unverified`; it does not grant a new usable epoch | `db/queries.rs:630–709`; `tools/wechat_read_identity.rs:362–378` |
-| WeChat process replaced, boot changed, session row replaced, account directory/root changed | Changes a hashed field and hence epoch, even if the displayed account name/wxid is unchanged | `tools/wechat_read_identity.rs:440–470` |
-| Only agent-server restarts, with all seven facts unchanged | Does not itself change the digest; **in-memory cursor caches are nevertheless lost** | Same hash inputs; `tools/wechat_read_pages.rs` in-memory store |
-| External UI logout/login without the recorded login write, with process/root unchanged | May not change epoch; it is **not continuous proof of every UI login transition** | `tools/wechat_read_identity.rs:20–26` |
-
-The generation is advanced by the login plan and logout handler through `update_session_logged_in_user` (`plans/login.rs:266`, `router/status.rs:189`); it is not a counter that ordinary polling increments. Migration `V4__session_login_generation.sql:12–18` initializes existing logged-in rows to generation 1. The account ID derivation is a storage-layout mapping, not a new UI authentication mechanism (`tools/wechat_read_identity.rs:413–438`).
-
-### Actual checks and their refusal effects
-
-Here `R` means `router/read.rs`, `P` means `tools/wechat_read_pages.rs`, `TX` means `router/send_text.rs`, and `TF` means `router/send_file.rs`.
-
-| Entry/check | Actual comparison | Refusal and concrete effect | Can wxid alone replace it? / decision boundary |
-|-------------|-------------------|-----------------------------|----------------------------------------------|
-| `GET /api/read/identity` | Captures process/session/root evidence; returns epoch, accepts no expected epoch | Unavailable/unverified identity or deadline means no identity document | Account wxid can describe identity, but not this generation; retain internal capture if generation-scoped reads are retained. `R:1191–1205`; identity sampler `tools/wechat_read_identity.rs:296–349` |
-| Message and contact first pages and continuation pages | Required caller `expectedEpoch` versus freshly captured epoch | Missing/empty token 400; mismatch 409 `scope_changed`, before collecting/serving rows | Proposal: remove the public epoch prerequisite, express intended account by wxid, and retain consistency inside the server and opaque cursor. `R:852–908,1163–1173,1258,1333` |
-| Message/contact DELETE snapshot routes | Same caller epoch check, then current scope versus stored scope | 400 for invalid request, 409 for mismatch; no foreign-scope release; absent sample returns false | Wxid alone does not bind resource or generation. Proposal: keep scoped cleanup internally; callers may release an opaque handle, not reconstruct snapshot scope. `R:1515–1562`; `P:339–354` |
-| Raw voice read | Caller epoch, requested message identifiers, and relevant source-key facts | Wrong generation/message/source refuses the read rather than returning unrelated bytes | Wxid alone cannot establish which message/media source the caller meant. Keep message/source checks and internal identity consistency. `R:981–1007,1424,1435–1445` |
-| All five epoch-bearing read/release handlers, after work | Recaptures and compares the complete `ReadId`, not just the caller string | 409 if changed; capture errors remain errors; just-published page samples are best-effort released | Prevents a request spanning different identities/roots. Keep internal comparison independently of any public parameter decision. `R:1178–1188,1309–1311,1374–1376,1445,1532,1557` |
-| Cursor continuation and cache release | Stored `account_dir + resource + epoch` versus server-built current scope; resource is `messages:<chat_id>` or `contacts` | Wrong scope 409; absent/expired cursor 410; same cursor replays the same frozen page until expiry/release | Wxid alone loses per-resource and per-generation isolation. Keep internal scope; no automatic eviction of valid cursors is implied. `R:1056–1088`; `P:49–54,304–354` |
-| Dedicated text/file send, before execution | Caller `expectedEpoch` versus captured epoch | 409 `scope_changed` without entering the send plan | **Candidate for removing the caller parameter**, if the intended sender wxid and recipient are independently validated. Same-account generation change alone is not an established business reason to discard a queued send. `TX:410–413`; `TF:621–624` |
-| Dedicated text/file send, immediately before Return | Recaptured epoch versus expected epoch; separately, native selected chat versus `chatId` | 200 execution response with `errorCode`; no Return on refusal, `commitAttempted:false` | Retain target verification. Whether to retain internal same-operation generation checking is separate from requiring an external token. `TX:297–311`; `plans/send_message.rs:1445–1458` |
-| Dedicated text/file send, after a reached goal and attempted commit | Server-captured before/after identity plus native selected chat | 200 with failure/unconfirmed flags on mismatch; cannot undo an attempted send | Keep truthful result reporting; do not infer “not sent” or retry merely from a post-check refusal. `TX:433–444`; `TF:650–661` |
-
-The first-page source-set/key checks are **additional internal checks, not additional epoch parameters**: messages compare discovered key names, contacts compare the `contact.db` key, and raw voice compares the requested message-shard key plus media keys (`R:1090–1136,1276–1279,1351–1354,1435–1440`). Snapshot UUIDs and the absolute 300-second TTL are also separate from the identity epoch. A frozen sample describes captured local rows, not a simultaneous transaction across every database.
-
-### Where epoch is not used
-
-Legacy chat/contact/message/media endpoints, `/api/messages/send`, session management, status/debug, and VNC/events do not require `expectedEpoch`. Login/logout **update the generation** but do not ask the caller to provide one. Outgoing voice jobs use account ownership, idempotency, a shared GUI guard and destination selection; they have **no epoch field or `LiveSendFence`** (`router/voice.rs:39–44,58–218,265–298,323–359`). There is no separate epoch-based contact permission system in this repository.
-
-### Decision summary — recommendations, not changes
-
-- **Sending:** consolidating on one sender and removing its caller-supplied `expectedEpoch` is a viable design candidate, not an implemented patch. It requires an explicit intended-sender identity check, not just checking recipient `chatId`. Re-login of the same account changes a recorded epoch, but this audit establishes no business requirement to reject a queued send solely for that reason.
-- **Reading:** keep frozen-row reuse, resource-scoped cursors, scoped release, source consistency and before/after identity checks internally. An old cursor must not become valid merely because the same wxid is logged in again. Remove public `expectedEpoch`/account-directory/shard prerequisites in the proposed simplified contract; retain their necessary internal guarantees through server-owned state and opaque handles. Migration still requires approval.
-- **Redundant API surface:** generic sending overlaps dedicated text/file sending; legacy message/contact listing overlaps frozen reads but differs in pagination, coverage and refusal semantics. Login QR polling overlaps part of the login WS presentation, but only WS runs the login plan. Voice jobs are a separate asynchronous operation, not an interchangeable file-send response.
-- **Potential removal scope if consolidation is approved:** the two dedicated route registrations, request/response validation and route-specific tests can be removed together. `send_file.rs` currently imports identity/error/fence helpers from `send_text.rs`; plan fence branches are used by both dedicated routes. They are not independent one-file deletions. Preserve the shared execution loop/GUI guard, native chat selection, general send plan, upload limits, media helpers, voice jobs and identity/paging code needed by reads. Any useful checks retained for unified sending need moving before their old modules are removed (`router/send_file.rs:69–73`; `plans/send_message.rs:12–65,999–1042`; `execution/mod.rs:28–82`; `router/mod.rs:39–42`).
-
-Separating file-readiness refusals from target changes and preserving filenames in the legacy route remain follow-up work. Dedicated Chinese-filename delivery has been verified on the tested client build with the UTF-8 launch environment; this does not establish compatibility with every filename or client build. This inventory does not authorize deleting endpoints, changing gates, sending a diagnostic message, or treating unit tests as a new live-send acceptance result.
-
-## Proposed upstream/downstream boundary
-
-**Direction approved; endpoint/schema migration not implemented.** The API should expose stable account wxids, contact/message identities, content/files/audio, and explicit operation results. Internal identity generations and source layout remain the server's responsibility. In particular, today's storage-derived `accountId` must not simply be relabelled “verified account wxid” without establishing the identity source.
-
-| Area | Current implementation | Proposed server responsibility | Proposed downstream removal | Still to decide |
-|------|------------------------|--------------------------------|-----------------------------|-----------------|
-| Account scope | Identity returns account directory and epoch; dedicated reads/sends require caller epoch | Resolve a stable account wxid; accept expected sender/account wxid, check it against the live account under the appropriate guard | Epoch acquisition/comparison and account-directory interpretation | Wire placement/name of `expectedAccountWxid`, reliable wxid source and compatibility period |
-| Snapshot lifecycle and pagination | Caller starts a frozen sample, follows cursor, supplies epoch and can explicitly release sample | Own source isolation, freezing, TTL/capacity and cleanup; validate opaque cursor against internal account/resource/generation | Reconstructing snapshot scope, database-root tracking, duplicate pagination state machines | Page envelope, transparent cleanup versus optional opaque-handle release, expiry result |
-| Voice/media lookup | Raw voice request contains shard/local/server/time identifiers | Return a message/media handle; resolve its internal shard/row and fetch bytes, preserving pending/unavailable distinctions | Assembling shard-based voice requests and locating media in WeChat storage | Handle lifetime, encoding/streaming and bounded retry guidance for pending reads |
-| Send selection and readiness | Generic and dedicated send paths overlap; dedicated file preparation can report `target_changed` for composer failure | One coherent send implementation owns GUI guard, target selection, input/attachment readiness and before-commit checks | GUI/composer probing and redundant WeChat-state validation | Which compatibility routes remain and precise failure/result schema |
-| Upload validation and naming | Dedicated upload requires caller digest/size; the legacy route rewrites filenames, while the paste helper retains the staged path | Keep normal size/encoding/basename validation; preserve filenames through staging and URI/paste handling; compute received digest/size | Mandatory duplicate transport checks not tied to an approved artifact; keep any genuine artifact approval in business logic | Optional approved-artifact digest contract; broader filename compatibility |
-| Results and uncertainty | Generic `success`; dedicated `commitAttempted/uiConfirmed`; neither guarantees delivery | Distinguish rejected-before-submit, attempted/unconfirmed, and evidence-backed observed outgoing result; separate account/target/preparation failures | Inferring delivery from HTTP 200, rebuilding GUI confirmation logic, or blindly resubmitting an unknown outcome | Stable result vocabulary and an opaque operation-status/reconciliation facility, if provided |
-
-### Proposed account check sequence
-
-1. The downstream request expresses **expected account wxid** and recipient `chatId`, alongside the content or opaque cursor/media handle. The proposed account field describes intent, not a process generation; clients do not manufacture epochs or shard names.
-2. For sends, the server acquires the shared GUI guard, resolves the actual account and rejects a different account **before preparing content**. It selects and verifies the recipient, prepares the composer/attachment, and rechecks account and recipient immediately before dispatching the send action.
-3. Internal process/session changes can invalidate a prepared operation or a read handle. The server handles that state transition and reports a specific refusal/expiry; it must not silently reinterpret an old request as belonging to another account. Re-login of the same account before preparation is not, by itself, a business revocation of queued intent.
-4. After a possibly attempted send, the server reports the evidence it actually has. If the outcome is unknown, it remains unknown; account drift or a failed post-check cannot undo an action already dispatched. The downstream keeps its task, recipient authorization, queue, single-submission policy and send ledger, and does not blindly retry.
-
-Reads follow the same account-intent boundary without requiring business callers to understand snapshot internals. An opaque cursor or media handle must be validated by the server; passing it back unchanged is not permission to reinterpret it for another account. HTTP 200 remains a transport/handler result, never a blanket promise of WeChat delivery.
+`/vnc/` serves a token prompt or viewer HTML (`autoconnect=true|1`); the static route does not validate the token itself. `/vnc/{*path}` serves assets, rejects `..` with 403 and returns 404 for missing files. Input permissions are controlled by the VNC backend, not the proxy; see [VNC Viewer](/operations/vnc) for deployment-specific access.
