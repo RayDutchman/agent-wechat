@@ -12,9 +12,20 @@ on:
       - 'tsconfig.json'
       - '.github/workflows/ci.yml'
 
+permissions:
+  contents: read
+  # dorny/paths-filter reads the changed files of a pull request through the
+  # pull request API.
+  pull-requests: read
+
+# Supersede older runs of the same pull request.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ts: ${{ steps.filter.outputs.ts }}
       rust: ${{ steps.filter.outputs.rust }}
@@ -36,6 +47,7 @@ jobs:
               - '.github/workflows/ci.yml'
             rust:
               - 'packages/agent-server-rust/**'
+              - 'packages/agent-server-rust/Cargo.lock'
               - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
@@ -45,7 +57,7 @@ jobs:
   ts:
     needs: changes
     if: needs.changes.outputs.ts == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -58,7 +70,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Install dependencies
@@ -76,7 +88,7 @@ jobs:
   rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -85,17 +97,29 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        id: rust
+        with:
+          toolchain: 1.93.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/agent-server-rust -> target
+          # The automatic hash includes unused preinstalled toolchains, which
+          # differ across runner images. Key the compiler we actually select.
+          add-rust-environment-hash-key: false
+          key: rust-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('packages/agent-server-rust/Cargo.toml', 'packages/agent-server-rust/Cargo.lock') }}
 
       - name: Cargo check
-        run: cargo check --manifest-path packages/agent-server-rust/Cargo.toml
+        run: cargo check --locked --manifest-path packages/agent-server-rust/Cargo.toml
 
       - name: Cargo test
-        run: cargo test --manifest-path packages/agent-server-rust/Cargo.toml
+        run: cargo test --locked --manifest-path packages/agent-server-rust/Cargo.toml
 
   docs:
     needs: changes
     if: needs.changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -108,7 +132,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Install dependencies

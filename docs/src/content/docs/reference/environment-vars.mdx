@@ -18,6 +18,7 @@ description: All environment variables used by agent-wechat.
 | `PROXY` | — | Transparent proxy address (format: `user:pass@host:port` or `socks5://...`) |
 | `DISPLAY` | `:99` | X11 display (set automatically by the container entrypoint) |
 | `DBUS_SESSION_BUS_ADDRESS` | — | D-Bus session bus address (set automatically) |
+| `WECHAT_NATIVE_MEDIA_DOWNLOAD` | `true` | Enable the server-owned native media download worker. Only exact `true` or `false` values are accepted; any other value disables native requests. Local media cache reads remain available. |
 
 ## 桌面环境配置
 

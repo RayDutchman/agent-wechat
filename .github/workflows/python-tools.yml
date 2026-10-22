@@ -9,9 +9,17 @@ on:
       - 'tests/media-download.test.cjs'
       - '.github/workflows/python-tools.yml'
 
+permissions:
+  contents: read
+
+# Supersede older runs of the same pull request.
+concurrency:
+  group: python-tools-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   regression:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,7 +27,8 @@ jobs:
           python-version: '3.12'
       # SQLCipher 4 integration is additionally exercised in research containers.
       - run: python3 -m unittest discover -s tests -v
+      - run: python3 docker/tools/test_a11y_dump.py
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - run: node --test tests/media-download.test.cjs

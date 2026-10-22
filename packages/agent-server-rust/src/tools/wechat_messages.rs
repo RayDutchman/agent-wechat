@@ -1988,6 +1988,20 @@ mod snapshot_tests {
     const CHAT_ID: &str = "test-chat";
     const ACCOUNT: &str = "wxid_snapshot_fixture";
 
+    #[test]
+    fn only_valid_database_authentication_failures_raise_a_recovery_signal() {
+        let cancel = CollectionCancel::within(Duration::from_secs(1));
+        cancel.record_authentication_failure("message_12.db");
+        assert_eq!(cancel.authentication_failure().as_deref(), Some("message_12.db"));
+
+        let invalid = CollectionCancel::within(Duration::from_secs(1));
+        invalid.record_authentication_failure("../message_12.db");
+        assert_eq!(invalid.authentication_failure(), None);
+
+        cancel.record_authentication_failure("media_4.db");
+        assert_eq!(cancel.authentication_failure().as_deref(), Some("message_12.db"));
+    }
+
     // ── Row fixture ────────────────────────────────────────────────────────
 
     /// One `Msg_<md5>` row. `local_id` and `create_time` are raw SQL values so a

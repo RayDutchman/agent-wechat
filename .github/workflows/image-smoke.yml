@@ -1,0 +1,64 @@
+name: Image smoke
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'packages/agent-server-rust/**'
+      - 'scripts/smoke-image-startup.sh'
+      - '.github/workflows/image-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede older runs of the same pull request.
+concurrency:
+  group: image-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Docker context
+        run: |
+          rm -rf docker/agent-server-rust
+          mkdir -p docker/agent-server-rust
+          cp packages/agent-server-rust/Cargo.toml docker/agent-server-rust/
+          [ -f packages/agent-server-rust/Cargo.lock ] && cp packages/agent-server-rust/Cargo.lock docker/agent-server-rust/
+          cp -r packages/agent-server-rust/src docker/agent-server-rust/
+          cp -r packages/agent-server-rust/migrations docker/agent-server-rust/
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      # Each architecture is built on a native runner, so the image can be
+      # loaded into the local image store and tested before it is used.
+      - name: Build the target image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: docker
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: agent-wechat-smoke:${{ matrix.arch }}-${{ github.sha }}
+          cache-from: type=gha,scope=image-smoke-${{ matrix.arch }}
+          cache-to: type=gha,scope=image-smoke-${{ matrix.arch }},mode=max
+
+      - name: Smoke test the built image
+        env:
+          IMAGE_REF: agent-wechat-smoke:${{ matrix.arch }}-${{ github.sha }}
+        run: bash scripts/smoke-image-startup.sh "$IMAGE_REF"

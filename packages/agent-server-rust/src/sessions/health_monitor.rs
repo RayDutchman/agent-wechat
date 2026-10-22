@@ -1,18 +1,9 @@
 use std::{path::PathBuf, sync::atomic::{AtomicBool, Ordering}};
-use std::time::Instant;
-
-use crate::ia::identify_states;
 use crate::sessions::manager::get_session;
-use crate::tools::a11y::get_a11y_desktop;
-use crate::tools::exec::ExecOptions;
-use crate::tools::screenshot::capture_screenshot;
 use crate::tools::wechat_db::{find_account_dir, find_wechat_pid};
 
 /// How often to run the health scan (in seconds).
 const SCAN_INTERVAL_SECS: u64 = 1;
-
-/// Kill WeChat if no IA state has been identified for this long (in seconds).
-const UNRESPONSIVE_TIMEOUT_SECS: u64 = 120;
 
 /// Delay before restarting WeChat after a crash (in seconds).
 const RESTART_DELAY_SECS: u64 = 3;
@@ -35,6 +26,10 @@ pub fn resume_monitoring() {
     MONITORING_PAUSED.store(false, Ordering::Relaxed);
 }
 
+fn process_should_restart(process_present: bool, previously_running: bool) -> bool {
+    !process_present && previously_running
+}
+
 /// Spawn WeChat process for the given session using the shared launch script.
 fn spawn_wechat(session: &crate::ia::types::Session) {
     // Use DBUS_SESSION_BUS_ADDRESS from our own environment (inherited from
@@ -54,25 +49,22 @@ fn spawn_wechat(session: &crate::ia::types::Session) {
 
 /// Spawn the background health monitor task.
 ///
-/// Every second, it checks the default session's WeChat process by running
-/// a11y → identify. If WeChat has crashed, it restarts it. If no IA state
-/// has been identified for more than 120 seconds, it kills and restarts it.
+/// Checks the default session's WeChat process. A live but unresponsive process
+/// is left alone; a process that disappears is restarted with bounded backoff.
 pub fn spawn_health_monitor() {
     tokio::spawn(async move {
         tracing::info!("[health] WeChat health monitor started");
 
-        let mut last_identified = Instant::now();
         let mut was_running = false;
         let mut restart_count: u32 = 0;
-        let mut window_start = Instant::now();
-        let mut waiting_restart_since: Option<Instant> = None;
+        let mut window_start = tokio::time::Instant::now();
+        let mut waiting_restart_since: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(SCAN_INTERVAL_SECS)).await;
 
             // Skip if monitoring is paused (an execution loop is active)
             if MONITORING_PAUSED.load(Ordering::Relaxed) {
-                last_identified = Instant::now();
                 continue;
             }
 
@@ -81,13 +73,12 @@ pub fn spawn_health_monitor() {
                 Some(s) if s.status == "running" => s,
                 _ => {
                     crate::tools::wechat_events::change_monitor().set_source(None).await;
-                    last_identified = Instant::now();
                     continue;
                 }
             };
 
             // Check if WeChat process is even running
-            let wechat_pid = match find_wechat_pid() {
+            match find_wechat_pid() {
                 Some(pid) => {
                     let source = find_account_dir(pid).and_then(message_data_root);
                     crate::tools::wechat_events::change_monitor().set_source(source).await;
@@ -96,16 +87,15 @@ pub fn spawn_health_monitor() {
                         was_running = true;
                         waiting_restart_since = None;
                     }
-                    pid
                 }
                 None => {
                     crate::tools::wechat_events::change_monitor().set_source(None).await;
-                    if was_running {
+                    if process_should_restart(false, was_running) {
                         tracing::warn!(
                             "[health] WeChat process disappeared (likely crashed), restarting"
                         );
                         was_running = false;
-                        waiting_restart_since = Some(Instant::now());
+                        waiting_restart_since = Some(tokio::time::Instant::now());
                     }
 
                     // Handle restart with crash loop protection
@@ -113,7 +103,7 @@ pub fn spawn_health_monitor() {
                         // Check crash loop
                         if window_start.elapsed().as_secs() > RAPID_WINDOW_SECS {
                             restart_count = 0;
-                            window_start = Instant::now();
+                            window_start = tokio::time::Instant::now();
                         }
 
                         let delay = if restart_count >= MAX_RAPID_RESTARTS {
@@ -135,40 +125,24 @@ pub fn spawn_health_monitor() {
                         }
                     }
 
-                    last_identified = Instant::now();
                     continue;
                 }
-            };
-
-            // Run a11y + identify to see if we can detect any state
-            let exec_options = ExecOptions {
-                session: Some(session.clone()),
-                timeout_ms: 10_000,
-            };
-
-            let a11y = match get_a11y_desktop(&exec_options).await {
-                Ok(tree) => tree,
-                Err(_) => {
-                    // a11y failed — count as unresponsive, don't reset timer
-                    check_and_kill(wechat_pid, &last_identified);
-                    continue;
-                }
-            };
-
-            let screenshot = capture_screenshot(&exec_options)
-                .await
-                .unwrap_or_default();
-            let identified = identify_states(&a11y, &screenshot);
-
-            if identified.main_window.is_some() {
-                // State identified — WeChat is responsive
-                last_identified = Instant::now();
-            } else {
-                // No state identified — check timeout
-                check_and_kill(wechat_pid, &last_identified);
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_should_restart;
+
+    #[test]
+    fn fake_process_loss_is_the_only_restart_trigger() {
+        let previously_running = true;
+        assert!(!process_should_restart(true, previously_running));
+        assert!(process_should_restart(false, previously_running));
+        assert!(!process_should_restart(false, false));
+    }
 }
 
 /// Resolve only the already-discovered account to its message data root.
@@ -179,45 +153,4 @@ fn message_data_root(account: String) -> Option<PathBuf> {
         .iter()
         .map(|root| PathBuf::from(root).join(&account).join("db_storage"))
         .find(|path| path.is_dir())
-}
-
-/// If time since last identified state exceeds the timeout, kill the WeChat process.
-fn check_and_kill(wechat_pid: i64, last_identified: &Instant) {
-    let elapsed = last_identified.elapsed();
-    if elapsed.as_secs() >= UNRESPONSIVE_TIMEOUT_SECS {
-        tracing::warn!(
-            "[health] WeChat (pid={}) unresponsive for {}s, killing process",
-            wechat_pid,
-            elapsed.as_secs()
-        );
-
-        let result = std::process::Command::new("kill")
-            .args(["-9", &wechat_pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                tracing::info!(
-                    "[health] Killed WeChat pid={}, will restart automatically",
-                    wechat_pid
-                );
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    "[health] kill returned non-zero for pid={}: {}",
-                    wechat_pid,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Err(e) => {
-                tracing::error!("[health] Failed to kill WeChat pid={}: {}", wechat_pid, e);
-            }
-        }
-    } else {
-        tracing::debug!(
-            "[health] WeChat unresponsive for {}s (threshold: {}s)",
-            elapsed.as_secs(),
-            UNRESPONSIVE_TIMEOUT_SECS
-        );
-    }
 }

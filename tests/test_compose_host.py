@@ -46,7 +46,10 @@ class HostComposeTest(unittest.TestCase):
         self.assertEqual(mounts["/home/wechat"]["source"], "agent-wechat-home")
         self.assertEqual(mounts["/data/auth-token"]["source"], env["AGENT_WECHAT_TOKEN_FILE"])
         self.assertTrue(mounts["/data/auth-token"]["read_only"])
-        self.assertFalse(mounts["/data/auth-token"]["bind"]["create_host_path"])
+        # Compose versions may omit false-valued fields from normalized JSON.
+        # A missing CreateHostPath is false in the normalized bind model;
+        # short-syntax binds instead normalize to explicit true.
+        self.assertFalse(mounts["/data/auth-token"]["bind"].get("create_host_path", False))
         self.assertEqual(service["environment"]["AGENT_HOST"], "[::]")
         self.assertEqual(service["environment"]["AGENT_PORT"], "6174")
         self.assertEqual(service["environment"]["AGENT_DB_PATH"], "/data/agent.db")

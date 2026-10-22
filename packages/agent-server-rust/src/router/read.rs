@@ -483,6 +483,10 @@ impl ReadBackend for ProcessReadBackend {
         // The message read keeps its own source requirement: at least one
         // numbered message shard must be stored for this account.
         if !has_message_source(&keys) {
+            crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                &id.session_id, &id.account_dir, &id.database_root, &keys,
+                vec![crate::tools::wechat_keys::KeyNeed::MessageShards],
+            );
             return Err(ReadError::KeysUnavailable);
         }
         Ok(keys)
@@ -496,6 +500,10 @@ impl ReadBackend for ProcessReadBackend {
         let keys = self.bound_keys(id, cancel).await?;
         // The roster requires its own key and nothing about message shards.
         if !has_contact_source(&keys) {
+            crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                &id.session_id, &id.account_dir, &id.database_root, &keys,
+                vec![crate::tools::wechat_keys::KeyNeed::Database("contact.db".to_string())],
+            );
             return Err(ReadError::KeysUnavailable);
         }
         Ok(keys)
@@ -512,6 +520,7 @@ impl ReadBackend for ProcessReadBackend {
         let account_dir = id.account_dir.clone();
         let chat_id = chat_id.to_string();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         // The same cancellation the caller holds, moved onto the blocking
         // thread: if the caller stops waiting, this collection stops too.
         let collection_cancel = cancel.clone();
@@ -520,8 +529,15 @@ impl ReadBackend for ProcessReadBackend {
         })
         .await
         .map_err(|_| ReadError::SourceReadFailed)?;
-        if collected.is_err() && cancel.authentication_failure().is_some() {
-            crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir);
+        if collected.is_err() {
+            if let Some(name) = cancel.authentication_failure() {
+                crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir, &name);
+            } else if collected == Err(crate::tools::wechat_messages::MessageSnapshotError::KeysUnavailable) {
+                crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                    &id.session_id, &id.account_dir, &id.database_root, &recovery_keys,
+                    vec![crate::tools::wechat_keys::KeyNeed::MessageShards],
+                );
+            }
         }
         collected.map_err(from_snapshot_error)
     }
@@ -534,6 +550,7 @@ impl ReadBackend for ProcessReadBackend {
     ) -> Result<Vec<Value>, ReadError> {
         let database_root = id.database_root.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         // The same cancellation the caller holds, moved onto the blocking
         // thread: if the caller stops waiting, this collection stops too.
         let collection_cancel = cancel.clone();
@@ -542,8 +559,15 @@ impl ReadBackend for ProcessReadBackend {
         })
         .await
         .map_err(|_| ReadError::SourceReadFailed)?;
-        if collected.is_err() && cancel.authentication_failure().is_some() {
-            crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir);
+        if collected.is_err() {
+            if let Some(name) = cancel.authentication_failure() {
+                crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir, &name);
+            } else if collected == Err(crate::tools::wechat_messages::MessageSnapshotError::KeysUnavailable) {
+                crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                    &id.session_id, &id.account_dir, &id.database_root, &recovery_keys,
+                    vec![crate::tools::wechat_keys::KeyNeed::Database("contact.db".to_string())],
+                );
+            }
         }
         collected.map_err(from_snapshot_error)
     }
@@ -556,8 +580,10 @@ impl ReadBackend for ProcessReadBackend {
         cancel: &CollectionCancel,
     ) -> Result<VerifiedVoice, ReadError> {
         let database_root = id.database_root.clone();
+        let source_shard = request.source_shard.clone();
         let request = request.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         // The same cancellation the caller holds, moved onto the blocking
         // thread: a read that outlives the caller's patience has to stop there.
         let collection_cancel = cancel.clone();
@@ -572,8 +598,18 @@ impl ReadBackend for ProcessReadBackend {
         })
         .await
         .map_err(|_| ReadError::SourceReadFailed)?;
-        if collected.is_err() && cancel.authentication_failure().is_some() {
-            crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir);
+        if collected.is_err() {
+            if let Some(name) = cancel.authentication_failure() {
+                crate::tools::wechat_keys::request_refresh_after_auth_failure(&id.session_id, &id.account_dir, &name);
+            } else if matches!(&collected, Err(VoiceReadError::KeysUnavailable)) {
+                crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                    &id.session_id, &id.account_dir, &id.database_root, &recovery_keys,
+                    vec![
+                        crate::tools::wechat_keys::KeyNeed::Database(source_shard),
+                        crate::tools::wechat_keys::KeyNeed::MediaShards,
+                    ],
+                );
+            }
         }
         collected.map_err(from_voice_error)
     }
