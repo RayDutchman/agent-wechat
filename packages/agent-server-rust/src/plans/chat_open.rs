@@ -1,4 +1,5 @@
 use super::Plan;
+use super::composer::find_edit_send_pair;
 use crate::ia::actions;
 use crate::ia::selectors::{query_selector, query_selector_all};
 use crate::ia::types::*;
@@ -23,37 +24,13 @@ pub enum ChatOpenPhase {
     Done,
 }
 
+/// The message editor of the open chat, or `None` when the observed tree holds
+/// no composer to focus.
+///
+/// Reuse the send path's pairing rules, including its proximity check for
+/// separately nested editor and Send controls.
 fn find_edit_area(a11y: &A11yNode) -> Option<&A11yNode> {
-    find_edit_near_send(a11y)
-}
-
-fn find_edit_near_send(node: &A11yNode) -> Option<&A11yNode> {
-    if let Some(children) = &node.children {
-        let has_send = children.iter().any(|c| {
-            c.role == "push-button" && c.name == "Send(S)"
-        });
-        let edit_node = children.iter().find(|c| {
-            c.role == "text"
-                && c.states
-                    .as_ref()
-                    .map(|s| s.iter().any(|st| st == "EDITABLE"))
-                    .unwrap_or(false)
-        });
-
-        if has_send {
-            if let Some(edit) = edit_node {
-                return Some(edit);
-            }
-        }
-
-        // Recurse
-        for child in children {
-            if let Some(result) = find_edit_near_send(child) {
-                return Some(result);
-            }
-        }
-    }
-    None
+    find_edit_send_pair(a11y).map(|(edit, _)| edit)
 }
 
 #[async_trait::async_trait]
@@ -209,6 +186,133 @@ impl Plan for ChatOpenPlan {
 
                 ChatOpenPhase::Done => return None,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// A message editor as the client reports it: an editable text field.
+    fn editor(y: f64) -> Value {
+        json!({"role":"text","name":"","states":["EDITABLE"],
+            "bounds":{"x":321.0,"y":y,"width":942.0,"height":79.0}})
+    }
+
+    /// A composer button. `Send` and `Send(S)` label the same control in
+    /// different builds; `Send Voice` is a different control.
+    fn send(name: &str) -> Value {
+        json!({"role":"push-button","name":name,"states":["DISABLED"],
+            "bounds":{"x":1204.0,"y":735.0,"width":55.0,"height":24.0}})
+    }
+
+    fn group(children: Vec<Value>) -> Value {
+        json!({"role":"filler","name":"","children":children})
+    }
+
+    fn parse(value: Value) -> A11yNode {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn identified() -> IdentifiedStates {
+        IdentifiedStates {
+            main_window: Some(IdentifiedState {
+                state_id: "chat_open".into(),
+                fsm: "main_window".into(),
+                frame: None,
+            }),
+            popup: None,
+            contact_card: None,
+            settings: None,
+        }
+    }
+
+    /// The older composer layout: the editor and the Send button are siblings.
+    fn flat_composer(send_name: &str) -> Value {
+        group(vec![editor(646.0), send(send_name)])
+    }
+
+    /// The newer composer layout: the editor and the Send button sit in
+    /// separate branches of the composer group.
+    fn nested_composer(send_name: &str) -> Value {
+        group(vec![
+            group(vec![editor(646.0)]),
+            group(vec![group(vec![send("Send Voice"), send(send_name)])]),
+        ])
+    }
+
+    /// The focus round must reach the composer editor for every Send label and
+    /// every composer layout, and it must click the editor — never the search
+    /// field that sits above the composer.
+    #[tokio::test]
+    async fn focusing_clicks_the_composer_editor_for_every_send_label_and_layout() {
+        for send_name in ["Send", "Send(S)"] {
+            for nested in [false, true] {
+                let composer = if nested {
+                    nested_composer(send_name)
+                } else {
+                    flat_composer(send_name)
+                };
+                let tree = parse(group(vec![editor(46.0), composer]));
+                let mut phase = ChatOpenPlanState {
+                    phase: ChatOpenPhase::Focusing,
+                    result: None,
+                };
+                let selected = ChatOpenPlan
+                    .select_action(
+                        &AppState::default(),
+                        &ChatOpenParams {
+                            chat_id: "filehelper".into(),
+                            clear_unreads: true,
+                        },
+                        &identified(),
+                        &mut phase,
+                        &tree,
+                        "default",
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        selected.map(|s| s.action),
+                        Some(Action::ClickCoords { x: 792.0, y: 686.0 })
+                    ),
+                    "the composer editor was not focused for {send_name}, nested={nested}"
+                );
+                assert!(matches!(phase.phase, ChatOpenPhase::ClickingAudio));
+            }
+        }
+    }
+
+    /// The chat search field is an editable field that is not the composer, and
+    /// `Send Voice` is not the Send control: neither may be focused.
+    #[tokio::test]
+    async fn focusing_ignores_the_search_field_and_the_voice_button() {
+        for value in [
+            group(vec![group(vec![editor(46.0)]), group(vec![send("Send")])]),
+            group(vec![editor(646.0), send("Send Voice")]),
+        ] {
+            let tree = parse(value);
+            let mut phase = ChatOpenPlanState {
+                phase: ChatOpenPhase::Focusing,
+                result: None,
+            };
+            let selected = ChatOpenPlan
+                .select_action(
+                    &AppState::default(),
+                    &ChatOpenParams {
+                        chat_id: "filehelper".into(),
+                        clear_unreads: true,
+                    },
+                    &identified(),
+                    &mut phase,
+                    &tree,
+                    "default",
+                )
+                .await;
+            assert!(selected.is_none(), "a non-composer control was focused");
+            assert!(matches!(phase.phase, ChatOpenPhase::Focusing));
         }
     }
 }
