@@ -21,6 +21,8 @@ Complete any phone confirmation and wait for the login command to finish. An int
 
 `wx status` checks container/server availability and the V2 account observation. `wx auth status` also uses that account API. Login status is a UI observation; an unrecognized UI is `unknown`, not proof of login. The old `/api/status` and `/api/status/auth` reads are retired.
 
+The health monitor restarts WeChat after its process disappears, with a short delay and a longer delay after repeated rapid restarts. A live process that is stuck is no longer killed automatically; `account GET` remains an observation of the UI and can report `unknown`. A user-closed WeChat process also looks like a disappearance and may be restarted; use `wx session stop <id>` to disable monitoring for that session. Missing decryption keys remain a `503 keys_unavailable` on the first read; qualifying reads and classified authentication failures schedule bounded, background key recovery. Identity-unknown cases do not trigger extraction. This recovery does not promise to bypass account restrictions or risk controls.
+
 For an existing container, `docker stop agent-wechat` and `docker start agent-wechat` stop and start it. Coordinate these with connected automation. `wx down` removes the container while retaining its data volumes; it is not the same operation as stopping it.
 
 ## Read chats, contacts, and messages

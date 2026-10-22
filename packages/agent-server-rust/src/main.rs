@@ -52,7 +52,6 @@ async fn main() {
     // Start background health monitor
     sessions::health_monitor::spawn_health_monitor();
     tracing::info!("WeChat health monitor started");
-    tools::wechat_keys::spawn_key_reconciler();
 
     // Build router
     let app = router::build_router();

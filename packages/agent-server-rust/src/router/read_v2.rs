@@ -292,11 +292,19 @@ impl V2Backend for ProcessReadBackend {
         let session_id = id.session_id.clone();
         let account = id.account_dir.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let snapshot = crate::tools::wechat_contacts::collect_contact_snapshot_v2_until(&root, &keys, &cancel);
-            if snapshot.is_err() && cancel.authentication_failure().is_some() {
-                crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account);
+            if snapshot.is_err() {
+                if let Some(name) = cancel.authentication_failure() {
+                    crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account, &name);
+                } else if snapshot == Err(MessageSnapshotError::KeysUnavailable) {
+                    crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                        &session_id, &account, &root, &recovery_keys,
+                        vec![crate::tools::wechat_keys::KeyNeed::Database("contact.db".to_string())],
+                    );
+                }
             }
             snapshot.map_err(V2Error::from)?
                 .into_iter()
@@ -311,11 +319,22 @@ impl V2Backend for ProcessReadBackend {
         let session_id = id.session_id.clone();
         let account = id.account_dir.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let snapshot = list_chat_snapshot_v2(&root, &keys, &cancel);
-            if snapshot.is_err() && cancel.authentication_failure().is_some() {
-                crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account);
+            if snapshot.is_err() {
+                if let Some(name) = cancel.authentication_failure() {
+                    crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account, &name);
+                } else if snapshot == Err(MessageSnapshotError::KeysUnavailable) {
+                    crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                        &session_id, &account, &root, &recovery_keys,
+                        vec![
+                            crate::tools::wechat_keys::KeyNeed::Database("session.db".to_string()),
+                            crate::tools::wechat_keys::KeyNeed::Database("contact.db".to_string()),
+                        ],
+                    );
+                }
             }
             snapshot.map_err(V2Error::from)?
                 .into_iter()
@@ -330,12 +349,20 @@ impl V2Backend for ProcessReadBackend {
         let session_id = id.session_id.clone();
         let account = id.account_dir.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         let room = room.to_string();
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let snapshot = crate::tools::wechat_group_members::list_group_members_v2_until(&root, &keys, &room, crate::tools::wechat_contacts::ContactBudget::default(), &cancel);
-            if snapshot.is_err() && cancel.authentication_failure().is_some() {
-                crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account);
+            if snapshot.is_err() {
+                if let Some(name) = cancel.authentication_failure() {
+                    crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account, &name);
+                } else if matches!(&snapshot, Err(crate::tools::wechat_group_members::GroupMemberReadError::Snapshot(MessageSnapshotError::KeysUnavailable))) {
+                    crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                        &session_id, &account, &root, &recovery_keys,
+                        vec![crate::tools::wechat_keys::KeyNeed::Database("contact.db".to_string())],
+                    );
+                }
             }
             snapshot.map_err(V2Error::from)?
                 .into_iter()
@@ -351,12 +378,20 @@ impl V2Backend for ProcessReadBackend {
         let session_id = id.session_id.clone();
         let account = id.account_dir.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         let chat = chat.to_string();
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let snapshot = crate::tools::wechat_messages::collect_message_snapshot_until(&root, &account_dir, &chat, &keys, &cancel);
-            if snapshot.is_err() && cancel.authentication_failure().is_some() {
-                crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account);
+            if snapshot.is_err() {
+                if let Some(name) = cancel.authentication_failure() {
+                    crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account, &name);
+                } else if snapshot == Err(MessageSnapshotError::KeysUnavailable) {
+                    crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                        &session_id, &account, &root, &recovery_keys,
+                        vec![crate::tools::wechat_keys::KeyNeed::MessageShards],
+                    );
+                }
             }
             snapshot.map_err(V2Error::from)
         }).await.map_err(|_| V2Error::SourceReadFailed)?
@@ -372,12 +407,20 @@ impl V2Backend for ProcessReadBackend {
         let session_id = id.session_id.clone();
         let account = id.account_dir.clone();
         let keys = keys.clone();
+        let recovery_keys = keys.clone();
         let chat = chat.map(str::to_string);
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let located = crate::tools::wechat_messages::locate_message_by_server_id(&root, &account_dir, &keys, server_id, chat.as_deref(), &known_chats, &cancel);
-            if located.is_err() && cancel.authentication_failure().is_some() {
-                crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account);
+            if located.is_err() {
+                if let Some(name) = cancel.authentication_failure() {
+                    crate::tools::wechat_keys::request_refresh_after_auth_failure(&session_id, &account, &name);
+                } else if matches!(&located, Err(MessageLocateError::Snapshot(MessageSnapshotError::KeysUnavailable))) {
+                    crate::tools::wechat_keys::request_refresh_after_missing_keys(
+                        &session_id, &account, &root, &recovery_keys,
+                        vec![crate::tools::wechat_keys::KeyNeed::MessageShards],
+                    );
+                }
             }
             located.map_err(V2Error::from)
         }).await.map_err(|_| V2Error::SourceReadFailed)?
@@ -954,6 +997,14 @@ mod tests {
             epoch: epoch.to_string(), database_root: PathBuf::from("/synthetic"),
             session_id: "test-session".to_string(),
         }
+    }
+
+    #[test]
+    fn keys_unavailable_keeps_the_retryable_503_contract() {
+        assert_eq!(read::status_for(ReadError::KeysUnavailable), StatusCode::SERVICE_UNAVAILABLE);
+        let error = V2Error::from(ReadError::KeysUnavailable);
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "keys_unavailable");
     }
 
     fn contact_rows(count: usize) -> Vec<Value> {
