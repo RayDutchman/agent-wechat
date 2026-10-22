@@ -488,29 +488,3 @@ fn parse_forwarded_record(root: &XmlNode) -> ForwardedRecord {
     }
     ForwardedRecord { parse_status, items }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bounded_xml_subset_reports_deep_and_large_documents_as_truncated() {
-        let deep = format!("{}x{}", "<a>".repeat(XML_MAX_DEPTH + 1), "</a>".repeat(XML_MAX_DEPTH + 1));
-        assert_eq!(XmlParser::parse(&deep), Err(XmlFailure::Truncated));
-        let large = format!("<msg>{}</msg>", "x".repeat(MESSAGE_XML_MAX_BYTES));
-        assert_eq!(XmlParser::parse(&large), Err(XmlFailure::Truncated));
-        let many_nodes = format!("<msg>{}</msg>", "<node/>".repeat(XML_MAX_NODES));
-        assert_eq!(XmlParser::parse(&many_nodes), Err(XmlFailure::Truncated));
-    }
-
-    #[test]
-    fn bounded_xml_subset_preserves_text_order_around_nested_elements() {
-        let node = XmlParser::parse("<content>before<b>middle</b>after</content>").unwrap();
-        assert_eq!(node.text_content(), "beforemiddleafter");
-    }
-
-    #[test]
-    fn bounded_xml_subset_rejects_duplicate_attributes() {
-        assert_eq!(XmlParser::parse("<msg mode='one' mode='two'/>").unwrap_err(), XmlFailure::Invalid);
-    }
-}

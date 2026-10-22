@@ -20,38 +20,38 @@ description: All environment variables used by agent-wechat.
 | `DBUS_SESSION_BUS_ADDRESS` | — | D-Bus session bus address (set automatically) |
 | `WECHAT_NATIVE_MEDIA_DOWNLOAD` | `true` | Enable the server-owned native media download worker. Only exact `true` or `false` values are accepted; any other value disables native requests. Local media cache reads remain available. |
 
-## 桌面环境配置
+## Desktop environment
 
-以下参数用于默认桌面和通过 session API 新启动的桌面。修改后需要重新启动对应桌面进程才生效；仅给已经运行的容器执行 `export` 不会改变现有微信进程。
+These settings apply to the default desktop and desktops newly started through the session API. Changes take effect after restarting the corresponding desktop process; running `export` in an already-running container does not change the existing WeChat process.
 
-| 变量 | 默认值 | 用途 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `WECHAT_SCREEN_WIDTH` | `1280` | Xvfb 屏幕宽度，正整数像素 |
-| `WECHAT_SCREEN_HEIGHT` | `800` | Xvfb 屏幕高度，正整数像素 |
-| `WECHAT_SCREEN_DEPTH` | `24` | Xvfb 屏幕色深，接受 `8`、`16`、`24`；只验证了默认 `24` 下的应用配置 |
-| `WECHAT_SCREEN_DPI` | `100` | Xvfb 显示 DPI，正整数 |
-| `WECHAT_LOCALE` | `C.UTF-8` | 微信启动时统一传给 `LANG`、`LC_ALL`、`LC_CTYPE` |
-| `TZ` | `UTC` | 进程时区，所选时区需镜像内已有对应 zoneinfo |
-| `ENABLE_VNC` | `1` | 默认桌面是否启动只读 VNC 与 websockify；设为 `0` 关闭自动启动 |
+| `WECHAT_SCREEN_WIDTH` | `1280` | Xvfb screen width in positive integer pixels |
+| `WECHAT_SCREEN_HEIGHT` | `800` | Xvfb screen height in positive integer pixels |
+| `WECHAT_SCREEN_DEPTH` | `24` | Xvfb screen depth; accepts `8`, `16`, or `24`. Application configuration has only been verified at the default `24`. |
+| `WECHAT_SCREEN_DPI` | `100` | Xvfb display DPI as a positive integer |
+| `WECHAT_LOCALE` | `C.UTF-8` | Set as `LANG`, `LC_ALL`, and `LC_CTYPE` when WeChat starts |
+| `TZ` | `UTC` | Process time zone; the selected zone must have zoneinfo available in the image |
+| `ENABLE_VNC` | `1` | Whether to start read-only VNC and websockify for the default desktop; set to `0` to disable automatic startup |
 
-中文文件路径已在 UTF-8 环境验证；不要把 locale 改成 `C`/`POSIX` 后仍假定中文行为不变。改变分辨率/DPI也可能影响具体客户端的布局和控件定位，需要在隔离环境检查实际界面。音频设备名及 48 kHz 单声道参数保持现有实现，本轮未开放音频配置。
+Chinese file paths have been verified in a UTF-8 environment; do not assume their behavior remains unchanged if the locale is set to `C` or `POSIX`. Resolution or DPI changes can affect the client's layout and control locations, so check the actual interface in an isolated environment. Audio device names and 48 kHz mono settings remain fixed by the current implementation; audio configuration is not exposed here.
 
-未设置或空值采用默认值；非空的非法参数在启动前拒绝，不静默改用另一组参数。locale 必须已安装，`C.UTF-8` 可规范化为镜像列出的等价 `C.utf8`；不自动安装语言包。数值参数为无前导零的正十进制 `u32`；该格式上限不是可分配屏幕尺寸的保证，超出实际资源仍会启动失败。
+Unset or empty values use the defaults. Nonempty invalid values are rejected before startup rather than silently replaced. The locale must be installed; `C.UTF-8` may be normalized to the equivalent `C.utf8` listed by the image. Language packs are not installed automatically. Numeric parameters must be positive decimal `u32` values without leading zeros; being within that format's range does not guarantee the screen dimensions can be allocated, and resource limits can still cause startup to fail.
 
-健康监控的界面不可识别超时现为 120 秒，仍沿用原有检测和重启逻辑；这是代码常量，不是本表新增的环境变量。延长等待不代表已解决采集失败或未知界面的原因。
+The health monitor's timeout for an unrecognized interface is currently 120 seconds and uses the existing detection and restart logic. This is a code constant, not an environment variable. A longer wait does not resolve the cause of a collection failure or unknown interface.
 
-### Dockerfile、启动脚本和 Compose 的分工
+### Dockerfile, startup scripts, and Compose responsibilities
 
-- **Dockerfile**：选择基础发行版、系统依赖、字体和微信安装包，并提供环境变量默认值。
-- **启动脚本及 session manager**：将环境变量真正传给 Xvfb 和微信；不是任意新增一个 Docker 环境变量就会自动生效。
-- **Compose / docker run**：选择镜像、主机名、网络、卷、token 挂载和资源配置。不把账号数据或 token 烘焙到镜像。
-- **宿主机**：提供内核与真实 CPU 能力。容器 CPU 配额不等于修改 CPU 型号，`FROM` 选择的发行版也不是另一套运行内核。
+- **Dockerfile**: Selects the base distribution, system dependencies, fonts, and WeChat package, and provides environment-variable defaults.
+- **Startup scripts and session manager**: Pass environment variables to Xvfb and WeChat; adding an arbitrary Docker environment variable does not make it take effect automatically.
+- **Compose / `docker run`**: Selects the image, hostname, network, volumes, token mount, and resource settings. Do not bake account data or tokens into the image.
+- **Host**: Provides the kernel and actual CPU capabilities. A container CPU quota does not change the CPU model, and the distribution selected by `FROM` is not a separate running kernel.
 
-### Host 网络 Compose 部署
+### Host-network Compose deployment
 
-仓库根目录的 `docker-compose.yml` 是唯一 Compose 配置，固定使用 host 网络，不设置 `ports`。非容器客户端必须连接运行 Docker 主机可达的真实地址（例如 `http://<host-address>:6174`），不能用 Docker 服务名 `agent-wechat` 假定容器网络可达。
+The repository-root `docker-compose.yml` is the only Compose configuration. It uses host networking and does not set `ports`. Clients outside the container must connect to an address reachable on the Docker host (for example, `http://<host-address>:6174`); do not assume the Docker service name `agent-wechat` is reachable through a container network.
 
-在仓库外保存本机配置，例如 `deployment.env`：
+Store machine-specific configuration outside the repository, for example in `deployment.env`:
 
 ```dotenv
 AGENT_WECHAT_IMAGE=sha256:replace-with-verified-image-id
@@ -68,20 +68,20 @@ TZ=UTC
 ENABLE_VNC=1
 ```
 
-将示例值替换为本机已验证的镜像 ID 或不可变 digest；Compose 禁止自动拉取。数据卷必须是已有外部卷。token 必须是原有 token 文件：不要为接管已有数据重新生成 token，否则现有客户端凭据将失效；缺失的 token 路径不会被自动创建成目录。仅全新独立部署时，先按下方首次部署说明准备卷和 token。配置固定 host 网络、API `[::]:6174`、原 capabilities/seccomp、64 MiB 共享内存及屏幕/locale/TZ/VNC 设置。
+Replace the example with a locally verified image ID or immutable digest; Compose does not pull images automatically. Data volumes must be existing external volumes. Use the existing token file: do not regenerate it when taking over existing data, or current client credentials will stop working. A missing token path is not automatically created as a directory. For a new, independent deployment only, prepare volumes and a token as described below. The configuration fixes host networking, API listener `[::]:6174`, existing capabilities/seccomp settings, 64 MiB shared memory, and screen/locale/TZ/VNC settings.
 
 ```bash
-# 只展开并检查配置，不启动或替换容器。
+# Render and inspect the configuration without starting or replacing a container.
 docker compose --env-file /path/to/deployment.env config
 ```
 
-实际接管已有容器会涉及停止业务及重建容器，须在维护窗口进行。核清原有卷名、token、hostname、程序版本和元数据，不把新建同名项目误当原容器就地更新。VNC 保持 `-viewonly`，5900 仅监听 `127.0.0.1` 和 `::1`，websockify 6080 仅回环，通过已认证的 API 代理访问。
+Taking over an existing container involves stopping the service and recreating the container, so do this during a maintenance window. Confirm the existing volume names, token, hostname, software version, and metadata; do not mistake a newly created project with the same name for an in-place update. Keep VNC in `-viewonly` mode. Port 5900 listens only on `127.0.0.1` and `::1`, and websockify on 6080 listens only on loopback; access it through the authenticated API proxy.
 
-### 客户端版本固定
+### Pinning the WeChat client version
 
-完整源码镜像构建当前优先使用 `docker/wechat.deb`，缺包时仍有官方可变 URL 下载路径；后者不能保证重建时得到同一微信版本。需要重新安装固定版本时，应保存已验证的原始安装包及其校验值，不能仅凭镜像标签推断微信版本。
+Full source image builds currently prefer `docker/wechat.deb`; if it is absent, the build can still download from an upstream mutable URL, which does not guarantee the same WeChat version on rebuild. To reinstall a pinned version, retain the verified original package and its checksum. An image tag alone does not identify the WeChat version.
 
-如果原安装包已不可得，可以从**已经验证且精确固定的运行镜像**派生配置更新镜像，保留其中的微信和系统依赖，仅替换已验收的 server/启动脚本。这是复用已有安装，不是从原始 deb 完整重建的证明。构建产物须在同一目标运行镜像检查 ABI 与实际启动；不要混入账号数据、临时调查文件或宿主构建的不兼容二进制。
+If the original package is no longer available, a configuration-update image can be derived from an **already verified and precisely pinned runtime image**, retaining its WeChat and system dependencies while replacing only the accepted server/startup scripts. This reuses an existing installation; it does not prove a complete rebuild from the original deb. Check ABI compatibility and actual startup in the same target runtime image. Do not include account data, temporary investigation files, or incompatible host-built binaries.
 
 ## File paths (inside the container)
 

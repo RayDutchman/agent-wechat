@@ -5,7 +5,7 @@ description: API endpoint reference for agent-wechat.
 
 The server exposes an HTTP API on port `6174`. This page describes the current router in `packages/agent-server-rust/src/router/mod.rs`, with V2 handlers in `router/read_v2.rs` and `router/send_v2.rs`. A registered route does not by itself prove useful events or message delivery.
 
-数据库字段原义、表间关联、通讯录筛选、消息类型及 `server_id` / `local_id` 的统一解释见 [微信数据库与字段字典](/operations/data)。本页维护 HTTP 契约，不另维护一套源数据库语义。
+For the canonical interpretation of database fields, table relationships, contact filters, message types, and `server_id` / `local_id`, see the [WeChat database field dictionary](/operations/data). This page documents the HTTP contract and does not duplicate source-database semantics.
 
 ## Authentication
 

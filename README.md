@@ -2,9 +2,9 @@
 
 A programmable WeChat interface. Controls a WeChat Linux client running in a Docker container through an HTTP API and the `wx` CLI.
 
-**[本分支文档](#documentation)** · [上游文档（不适用于本分支）](https://thisnick.github.io/agent-wechat/)
+**[Documentation](https://raydutchman.github.io/agent-wechat/)** · [Upstream](https://github.com/thisnick/agent-wechat)
 
-这是 RayDutchman 维护的 fork，保留 Rust server、shared TypeScript client 和 CLI；OpenClaw extension 与 Wechaty packages 已移除。上游 npm CLI、容器镜像和文档不代表本 fork 版本；本 fork 的旧路由也已退役。保留上游 LICENSE 与来源归属；变更通过 Git 历史和原始源码公开。
+This RayDutchman-maintained fork retains the Rust server, shared TypeScript client, and CLI; the OpenClaw extension and Wechaty packages have been removed. Upstream npm packages, container images, and documentation do not describe this fork, and this fork's legacy routes have been retired. The upstream license and attribution are retained; changes are available in Git history and the source code.
 
 ## Packages
 
@@ -71,6 +71,7 @@ wx down
 | `wx auth login` | Login flow (shows QR code) |
 | `wx auth status` | Show login status |
 | `wx auth logout` | Log out of WeChat |
+| `wx auth token [--regenerate]` | Show or regenerate the local API token |
 | `wx chats list` | List chats |
 | `wx chats get <id>` | Show one chat |
 | `wx chats open <id>` | Select a chat in WeChat |
@@ -121,25 +122,9 @@ The repository's [`docker-compose.yml`](./docker-compose.yml) uses host networki
 
 ## Documentation
 
-文档网站使用 **Astro + Starlight**。源文件位于 `docs/src/content/docs/`；`.mdx` 是可嵌入组件的 Markdown，标题、列表、表格和代码块仍使用 Markdown 写法。网站也支持普通 `.md`，不需要为了纯文本内容使用组件。
+See the [documentation site](https://raydutchman.github.io/agent-wechat/), including the [User Guide](./docs/src/content/docs/operations/user-guide.mdx), [API reference](./docs/src/content/docs/reference/api.mdx), and [database field dictionary](./docs/src/content/docs/operations/data.mdx).
 
-在想查看的仓库或工作树根目录执行：
-
-```bash
-pnpm --filter @agent-wechat/docs install --frozen-lockfile
-pnpm --filter @agent-wechat/docs dev
-```
-
-打开终端输出的网址。当前配置的基础路径是 `/agent-wechat`，默认端口下首页为 `http://127.0.0.1:4321/agent-wechat/`，数据库字段字典为 `http://127.0.0.1:4321/agent-wechat/operations/data/`。若提示 `astro: not found`，先在该工作树安装上述依赖。
-
-构建静态站点并预览：
-
-```bash
-pnpm --filter @agent-wechat/docs build
-pnpm --filter @agent-wechat/docs preview
-```
-
-常用入口：[使用指南](./docs/src/content/docs/operations/user-guide.mdx)、[API 契约](./docs/src/content/docs/reference/api.mdx)、[数据库字段字典](./docs/src/content/docs/operations/data.mdx)。当前用法放在文档站，开发过程记录放在 `.superpowers/`；历史设计不代替现行 API 契约。
+Documentation sources are in `docs/src/content/docs/`. Run `pnpm --filter @agent-wechat/docs dev` to preview changes locally.
 
 ## Development
 

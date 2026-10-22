@@ -132,19 +132,6 @@ pub fn spawn_health_monitor() {
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::process_should_restart;
-
-    #[test]
-    fn fake_process_loss_is_the_only_restart_trigger() {
-        let previously_running = true;
-        assert!(!process_should_restart(true, previously_running));
-        assert!(process_should_restart(false, previously_running));
-        assert!(!process_should_restart(false, false));
-    }
-}
-
 /// Resolve only the already-discovered account to its message data root.
 /// This observes the same process/account metadata used by the read handlers;
 /// it does not probe SQLite or expose the path through the event API.

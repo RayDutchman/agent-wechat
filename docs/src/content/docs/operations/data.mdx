@@ -1,86 +1,86 @@
 ---
-title: 微信数据库与字段字典
-description: 微信本地数据库、字段原义、关联关系、消息类型与 API 映射的统一参考。
+title: WeChat Database and Field Dictionary
+description: Unified reference for WeChat local databases, source field meanings, relationships, message types, and API mappings.
 ---
 
-本页是本项目微信本地数据语义的统一参考；HTTP 参数与返回契约见 [REST API](/reference/api)。后续已确认的字段含义优先更新本页，不另建平行字典。
+This page is the unified reference for this project's interpretation of local WeChat data. For HTTP parameters and response contracts, see [REST API](/reference/api). Update this page first when field meanings are confirmed; do not create a parallel dictionary.
 
-适用版本：Linux 微信 **4.1.13.23**。按数据库、表、源字段、关联关系和 API 映射组织；未输出字段也列入表结构。
+Applies to Linux WeChat **4.1.13.23**. Organized by database, table, source field, relationship, and API mapping; fields not exposed by the API are also included in the schemas.
 
-## 存储位置与数据库总览
+## Storage locations and database overview
 
-默认使用两个持久卷；部署可自定义名称，以实际挂载为准：
+Two persistent volumes are used by default. Deployments can customize their names; use the actual mounts as the source of truth:
 
-| 卷 | 容器路径 | 内容 |
+| Volume | Container path | Contents |
 |--------|---------------|----------|
-| `agent-wechat-data` | `/data` | 本项目 `agent.db`；认证令牌另以只读文件挂载 |
-| `agent-wechat-home` | `/home/wechat` | 微信账号数据库、附件、配置与缓存 |
+| `agent-wechat-data` | `/data` | This project's `agent.db`; the authentication token is mounted separately as a read-only file |
+| `agent-wechat-home` | `/home/wechat` | WeChat account databases, attachments, configuration, and cache |
 
-账号目录通常位于 `/home/wechat/xwechat_files/<account_directory>/`，数据库在其中的 `db_storage/`。目录名不是资料页昵称，也不能当作独立的 UI 登录证明。
+The account directory is usually `/home/wechat/xwechat_files/<account_directory>/`, with databases in its `db_storage/` subdirectory. The directory name is not the profile nickname and is not independent proof of UI login.
 
-| 相对 `db_storage/` 的路径 | 主要用途 | 本页覆盖 |
+| Path relative to `db_storage/` | Primary use | Coverage in this page |
 |---|---|---|
-| `contact/contact.db` | 联系人、群、公众号资料 | 已保存的六张表 schema 及已核语义 |
-| `session/session.db` | 本地会话列表、摘要、未读与排序 | `SessionTable` 完整 schema，共 19 列 |
-| `message/message_N.db` | 分片聊天记录 | 一个真实 `Msg_*` 表的完整列清单、当前查询规则 |
-| `message/media_N.db` | 语音数据及其关联 | `VoiceInfo`、`Name2Id` 已使用列 |
-| `message/message_resource.db` | 消息到媒体资源索引 | `ChatName2Id`、`MessageResourceInfo` 已使用列 |
-| `hardlink/hardlink.db` | 附件路径索引 | 图片相关表已使用列 |
-| `message/biz_message_N.db`、`message_fts.db`、`weclaw.db` | 已见这些文件；具体字段未完成核查 | 不据文件名宣称与普通消息分片同结构 |
-| `head_image/`、`emoticon/`、`favorite/`、`sns/`、`general/` 等 | 头像、表情、收藏、朋友圈等相关存储 | 尚未建立逐字段字典 |
+| `contact/contact.db` | Contact, group, and official-account profiles | Schemas for six documented tables and verified semantics |
+| `session/session.db` | Local conversation list, summaries, unread counts, and ordering | Complete `SessionTable` schema, 19 columns |
+| `message/message_N.db` | Sharded chat history | Complete column list for one actual `Msg_*` table and current query rules |
+| `message/media_N.db` | Voice data and relationships | Columns used from `VoiceInfo` and `Name2Id` |
+| `message/message_resource.db` | Message-to-media-resource index | Columns used from `ChatName2Id` and `MessageResourceInfo` |
+| `hardlink/hardlink.db` | Attachment path index | Columns used from image-related tables |
+| `message/biz_message_N.db`, `message_fts.db`, `weclaw.db` | These files have been observed; their fields have not been fully examined | Do not infer that they share the schema of ordinary message shards from their filenames |
+| `head_image/`, `emoticon/`, `favorite/`, `sns/`, `general/`, etc. | Related storage for profile images, stickers, favorites, Moments, and other data | No field-by-field dictionary yet |
 
-图片、视频和文件的大量字节在账号目录的 `msg/attach/`、`msg/video/`、`msg/file/` 等路径，不是全部存进 `message_N.db`。`.dat` 后缀也不表示普通明文图片。
+Much of the image, video, and file data is stored under paths such as `msg/attach/`, `msg/video/`, and `msg/file/` in the account directory; it is not all stored in `message_N.db`. A `.dat` suffix does not mean the file is an ordinary plaintext image.
 
-### 项目自己的 agent.db
+### The project's own agent.db
 
-- `/data/agent.db` 是本项目 SQLCipher 数据库，保存 session、应用状态、已取得的凭据和作业信息；它不是微信的 `contact.db` 或消息库。表定义以 `packages/agent-server-rust/migrations/` 为准，不能将其中 `sessions`、`wechat_keys` 等表解释为微信原生字段。
-- `/data/auth-token` 是宿主令牌的只读挂载，不应进入镜像或公开文档。
+- `/data/agent.db` is this project's SQLCipher database. It stores sessions, application state, acquired credentials, and job information; it is not WeChat's `contact.db` or message database. Table definitions are maintained in `packages/agent-server-rust/migrations/`. Tables such as `sessions` and `wechat_keys` are not native WeChat fields.
+- `/data/auth-token` is a read-only mount of the host token; it should not be included in images or public documentation.
 
-## contact.db：联系人、群与公众号
+## contact.db: contacts, groups, and official accounts
 
-以下为六张表的源字段；类型按实际 schema 记录。
+The following are source fields from six tables; types are recorded as declared in the actual schema.
 
-### contact 表
+### `contact` table
 
-| 源字段 | 源类型 | 内容及当前用法 |
+| Source field | Source type | Meaning and current use |
 |---|---|---|
-| `id` | INTEGER PRIMARY KEY | 本表内部整数 ID，不是 `username`；跨表使用需核具体关联 |
-| `username` | TEXT | 源账号／群／系统入口标识，原样传输；不保证以 `wxid_` 开头 |
-| `local_type` | INTEGER | 联系人记录类型；与消息表同名列不是同一套枚举，见下文 |
-| `alias` | TEXT | 资料页“微信号”，可用于登录；与内部 username 分开保存 |
-| `encrypt_username` | TEXT | 已见列，具体用途及编码未确认 |
-| `flag` | INTEGER | 位标志原值；完整位字典未确认，不能用 `flag & 2` 判朋友 |
-| `delete_flag` | INTEGER | 当前宽名录只取 0；不证明双向好友或对方未删除自己 |
-| `verify_flag` | INTEGER | 认证／特殊账号相关原值；完整位语义未确认，已观察的位 8 关系见下文 |
-| `remark` | TEXT | 本账号给对方设置的备注 |
-| `remark_quan_pin` | TEXT | 已见列；名称提示备注检索拼音，具体规则未核 |
-| `remark_pin_yin_initial` | TEXT | 已见列；具体拼音缩写规则未核 |
-| `nick_name` | TEXT | 对方填写、可修改的资料页“名字”，不是本账号备注 |
-| `pin_yin_initial` | TEXT | 已见列；具体检索生成规则未核 |
-| `quan_pin` | TEXT | 已见列；具体检索生成规则未核 |
-| `big_head_url` | TEXT | 大头像地址 |
-| `small_head_url` | TEXT | 小头像地址，旧联系人投影曾直接输出；当前 ContactV2 不输出 |
-| `head_img_md5` | TEXT | 头像摘要标识，非空值为 32 位字符串；保留原值，不作为当前头像下载文件的 MD5 校验值 |
-| `chat_room_notify` | INTEGER | 群通知设置：0＝不通知（开启消息免打扰）；1＝通知（未开启消息免打扰） |
-| `is_in_chat_room` | INTEGER | 0、1：仍在群内；2：已退群。不能按 0／非 0 判断是否在群；0 与 1 的具体区别未定 |
-| `description` | TEXT | 本账号给联系人添加的“备忘”文本，与昵称、备注名称分开保存 |
-| `extra_buffer` | BLOB | 额外二进制资料；未完成格式解析，不与群表 `ext_buffer` 混用 |
-| `chat_room_type` | INTEGER | 群相关分类原值，已读值为 0、2；具体含义未定，不推断为管理员设置或入群规则 |
+| `id` | INTEGER PRIMARY KEY | Internal integer ID for this table, not `username`; verify the specific relationship before using it across tables |
+| `username` | TEXT | Source identifier for an account, group, or system entry, passed through unchanged; it is not guaranteed to start with `wxid_` |
+| `local_type` | INTEGER | Contact-record type; the same-named message-table column uses a different enum, as described below |
+| `alias` | TEXT | “WeChat ID” shown on the profile page and usable for login; stored separately from the internal username |
+| `encrypt_username` | TEXT | Observed column; purpose and encoding are unconfirmed |
+| `flag` | INTEGER | Raw bit flags; the complete bit dictionary is unconfirmed. Do not use `flag & 2` to determine friendship |
+| `delete_flag` | INTEGER | The current broad roster selects only 0; this does not prove a mutual friendship or that the other party has not deleted this account |
+| `verify_flag` | INTEGER | Raw value related to verification or special accounts; full bit semantics are unconfirmed. See below for the observed relationship with bit 8 |
+| `remark` | TEXT | Remark this account assigned to the contact |
+| `remark_quan_pin` | TEXT | Observed column; the name suggests pinyin used for remark search, but exact behavior is unverified |
+| `remark_pin_yin_initial` | TEXT | Observed column; exact pinyin-abbreviation behavior is unverified |
+| `nick_name` | TEXT | The editable profile-page “name” supplied by the other party, not this account's remark |
+| `pin_yin_initial` | TEXT | Observed column; exact search-generation behavior is unverified |
+| `quan_pin` | TEXT | Observed column; exact search-generation behavior is unverified |
+| `big_head_url` | TEXT | Large profile-image URL |
+| `small_head_url` | TEXT | Small profile-image URL, directly exposed by an older contact projection; not exposed by current ContactV2 |
+| `head_img_md5` | TEXT | Profile-image digest identifier; nonempty values are 32-character strings. Preserve the source value; do not use it as the MD5 checksum for a currently downloaded profile image |
+| `chat_room_notify` | INTEGER | Group notification setting: 0 = notifications off (Do Not Disturb enabled); 1 = notifications on (Do Not Disturb disabled) |
+| `is_in_chat_room` | INTEGER | 0 or 1: still in the group; 2: left the group. Do not determine membership using 0/nonzero; the exact distinction between 0 and 1 is unresolved |
+| `description` | TEXT | “Memo” text this account added to the contact, stored separately from nickname and remark |
+| `extra_buffer` | BLOB | Additional binary data; format not fully parsed. Do not conflate it with the group table's `ext_buffer` |
+| `chat_room_type` | INTEGER | Raw group-related category; observed values are 0 and 2. Meaning is unresolved; do not infer admin settings or join rules |
 
-当前 ContactV2 保留 `username/alias/nick_name/remark/local_type`，附 `kind`、`display_name` 及可选 `official_type/verify_flag`。`display_name` 是 `trim(remark)` → `trim(nick_name)` → 原 username 的派生回退；源名称字段分别保留，不把派生显示名当全局原名。`flag` 和 `delete_flag` 没有直接暴露为 ContactV2 字段。
+Current ContactV2 retains `username/alias/nick_name/remark/local_type` and adds `kind`, `display_name`, and optional `official_type/verify_flag`. `display_name` is derived using `trim(remark)` → `trim(nick_name)` → the original username as fallback. Source name fields remain separate; the derived display name is not treated as a canonical name. `flag` and `delete_flag` are not exposed directly as ContactV2 fields.
 
-### kind、通讯录成员与双向好友是三件事
+### `kind`, address-book membership, and mutual friendship are distinct
 
-`kind` 当前分类优先级是：固定系统名单 → `@chatroom` 群 → `@openim` 企业 → 非空 `biz_info.type` 公众号 → `local_type=5` 企业、`1/3` 个人 → unknown。因此 `kind=individual` **不是好友标记**。尚未将研究中的类型 6 规则单独加入分类器；当前带 `@openim` 的类型 6 已由后缀识别。
+The current `kind` classification priority is: fixed system list → `@chatroom` group → `@openim` enterprise → official account with nonempty `biz_info.type` → `local_type=5` enterprise and `1/3` individual → unknown. Therefore, `kind=individual` is **not a friendship indicator**. A separately researched rule for type 6 has not been added to the classifier; current type-6 records with `@openim` are identified by the suffix.
 
-固定系统名单：`filehelper`、`fmessage`、`medianote`、`floatbottle`、`newsapp`、`fenvmsg`、`officialaccounts`、`weixin`、`weibo`、`qqmail`、`brandsessionholder`、`brandservicesessionholder`。名单不是微信所有系统账号的穷举；`@weclaw` 已观察为 ClawBot 特殊账号，当前 kind 仍可能为 individual。
+Fixed system list: `filehelper`, `fmessage`, `medianote`, `floatbottle`, `newsapp`, `fenvmsg`, `officialaccounts`, `weixin`, `weibo`, `qqmail`, `brandsessionholder`, `brandservicesessionholder`. This is not an exhaustive list of all WeChat system accounts. `@weclaw` has been observed as a special ClawBot account, though its current `kind` may still be `individual`.
 
-**普通通讯录筛选**：在 `delete_flag=0` 的有效记录中取 `local_type=1`，排除自身、系统号、群、企业、ClawBot 及已知公众号。
+**Ordinary address-book filter**: Among valid records with `delete_flag=0`, select `local_type=1` and exclude the current account, system entries, groups, enterprises, ClawBot, and known official accounts.
 
-使用当前 ContactV2 的消费方可在成功校验响应后采用：
+Consumers of current ContactV2 can apply this after validating a successful response:
 
 ```python
-# SYSTEM_USERNAMES 为上面的固定名单；account_username 来自可信当前账号。
+# SYSTEM_USERNAMES is the fixed list above; account_username comes from the trusted current account.
 def is_ordinary_address_book_contact(contact, account_username):
     username = contact["username"]
     return (
@@ -94,43 +94,43 @@ def is_ordinary_address_book_contact(contact, account_username):
     )
 ```
 
-`official_type=0` 仍是有效公众号类型，不能写成 `not official_type`。上游已过滤 `delete_flag=0`；消费方不应要求 DTO 中不存在的 delete_flag。此谓词表达的是本地普通通讯录口径，不检测对方是否把自己删除。
+`official_type=0` is still a valid official-account type; do not write this as `not official_type`. The upstream query already filters `delete_flag=0`; consumers should not require a `delete_flag` field that is absent from the DTO. This predicate represents the local ordinary-address-book definition and does not detect whether the other party deleted this account.
 
-分类规则：
+Classification rules:
 
-| 字段组合 | 结论 |
+| Field combination | Conclusion |
 |---|---|
-| `local_type=3` | 群成员等缓存个人，不纳入普通朋友通讯录 |
-| `local_type IN (5,6)`、`@openim` | 企业联系人；当前 API 优先通过后缀识别 |
-| `verify_flag & 8 != 0`、非空 `biz_info.type` | 公众号资料识别；系统号优先，子类型仍取 biz_info.type |
-| `flag & 2` | 不用于朋友判定 |
-| `(local_type,flag,verify_flag)=(1,3,0)` | 个人与群均可使用，仍需区分群身份 |
-| `(local_type,flag,verify_flag)=(1,1,0)` | 普通个人、自身、系统号和 ClawBot 均可使用，仍需排除特殊身份 |
+| `local_type=3` | Cached people such as group members; excluded from the ordinary-friend address book |
+| `local_type IN (5,6)`, `@openim` | Enterprise contacts; the current API prioritizes suffix-based identification |
+| `verify_flag & 8 != 0`, nonempty `biz_info.type` | Identifies official-account profiles; system entries take precedence, while the subtype still comes from `biz_info.type` |
+| `flag & 2` | Not used to determine friendship |
+| `(local_type,flag,verify_flag)=(1,3,0)` | Can apply to both individuals and groups; group identity still needs to be distinguished |
+| `(local_type,flag,verify_flag)=(1,1,0)` | Can apply to ordinary people, the current account, system entries, and ClawBot; special identities still need to be excluded |
 
-### biz_info 表与 NULL 关联边界
+### `biz_info` table and NULL join boundaries
 
-真实列清单：`id INTEGER PRIMARY KEY`；`username TEXT`；`type/accept_type/child_type/home_url/version/external_info/brand_flag` 为 INTEGER；`sync_version/brand_info/brand_icon_url/brand_list/belong` 为 TEXT；`ext_buffer BLOB`。源 `home_url` 虽叫 URL，在该 schema 声明为 INTEGER，不按名字改类型。
+Actual column list: `id INTEGER PRIMARY KEY`; `username TEXT`; `type/accept_type/child_type/home_url/version/external_info/brand_flag` are INTEGER; `sync_version/brand_info/brand_icon_url/brand_list/belong` are TEXT; `ext_buffer BLOB`. Although the source column is named `home_url`, the schema declares it INTEGER; do not change its type based on its name.
 
-当前只按完整 `username` 与 contact 做 LEFT JOIN，取 `type` 为 `official_type`。已有样本支持 **0=订阅号、1=服务号**；2、3保原值，未确认完整类别。`accept_type/child_type` 等没有已确认的通用枚举。`external_info` 声明 INTEGER，但既有样本可读出含 `ServiceType` 的 JSON；SQLite 声明类型不等于每个值的实际类型，不能按声明盲转。
+Currently, only a LEFT JOIN on the complete `username` to `contact` is used, with `type` exposed as `official_type`. Existing samples support **0 = subscription account, 1 = service account**; values 2 and 3 are preserved, and the full set of categories is unconfirmed. No general enum has been confirmed for `accept_type`, `child_type`, or similar fields. `external_info` is declared INTEGER, but existing samples contain readable JSON with `ServiceType`; a SQLite declared type does not guarantee the runtime type of every value, so do not blindly convert it based on the declaration.
 
-**`official_type` 缺省有两种来源：无 biz_info 匹配行，或匹配行的 type=NULL。** 当前 LEFT JOIN 只取 b.type，kind 同样依据这个值，二者不提供独立的关联存在标志。
+**`official_type` can be absent for two reasons: no matching `biz_info` row, or a matching row whose `type` is NULL.** The current LEFT JOIN selects only `b.type`; `kind` is based on the same value. Neither provides an independent indicator that a matching row exists.
 
-### 群资料与群昵称
+### Group profiles and group nicknames
 
-| 表 | 真实列 | 已核用法／未确认项 |
+| Table | Actual columns | Verified use / unresolved items |
 |---|---|---|
-| `chat_room` | `id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB` | username 定位群；owner 群主字段的具体关联未单独核验；ext_buffer 已解析成员身份及群昵称 |
-| `chatroom_member` | `room_id INTEGER, member_id INTEGER`；二者 UNIQUE | 成员关联表；这两个整数与其它表 ID 的完整对应未独立核验，当前成员读取不依赖该推断 |
-| `chat_room_info_detail` | `room_id_ INTEGER PRIMARY KEY, username_ TEXT, announcement_ TEXT, announcement_editor_ TEXT, announcement_publish_time_ INTEGER, chat_room_status_ INTEGER, xml_announcement_ TEXT, ext_buffer_ BLOB` | 群公告及详情字段；尾下划线为真实源名，公告时间单位／状态枚举未核，当前未全部公开 |
-| `contact_label` | `label_id_ INTEGER PRIMARY KEY, label_name_ TEXT, sort_order_ INTEGER` | 标签及排序字段；与联系人关联位置尚未核验 |
+| `chat_room` | `id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB` | `username` identifies the group; the exact relationship of `owner` to the group-owner field has not been independently verified; `ext_buffer` has been parsed for member identity and group nicknames |
+| `chatroom_member` | `room_id INTEGER, member_id INTEGER`; both UNIQUE | Member relationship table; the full mapping of these integers to IDs in other tables has not been independently verified. Current member reads do not rely on that inference |
+| `chat_room_info_detail` | `room_id_ INTEGER PRIMARY KEY, username_ TEXT, announcement_ TEXT, announcement_editor_ TEXT, announcement_publish_time_ INTEGER, chat_room_status_ INTEGER, xml_announcement_ TEXT, ext_buffer_ BLOB` | Group announcement and detail fields; trailing underscores are part of the actual source names. Announcement time units and status enums are unverified, and not all fields are currently exposed |
+| `contact_label` | `label_id_ INTEGER PRIMARY KEY, label_name_ TEXT, sort_order_ INTEGER` | Label and sort-order fields; the relationship to contacts has not been verified |
 
-`chat_room.ext_buffer` 的 protobuf 结构：顶层字段 1 重复成员对象，成员字段 1 为 username、字段 2 为群昵称。`group_nickname` 绑定群和成员，与全局 `nick_name` 分开保存。
+Protobuf structure of `chat_room.ext_buffer`: repeated member objects are top-level field 1; member field 1 is username and field 2 is group nickname. `group_nickname` is scoped to the group and member, and stored separately from global `nick_name`.
 
-GroupMemberV2 输出 `room_username/username/group_nickname/display_name`。群内显示名优先级为：**备注 → 群昵称 → 全局昵称 → username**。NULL／空 ext_buffer 返回空本地成员结果。
+GroupMemberV2 exposes `room_username/username/group_nickname/display_name`. In-group display-name priority is **remark → group nickname → global nickname → username**. A NULL or empty `ext_buffer` returns an empty local member result.
 
-## session.db：会话列表
+## session.db: conversation list
 
-`SessionTable` 的完整表结构如下，共 19 列：
+The complete `SessionTable` schema has 19 columns:
 
 ```sql
 CREATE TABLE SessionTable(
@@ -156,209 +156,209 @@ CREATE TABLE SessionTable(
 );
 ```
 
-| 源列 | 内容／处理 | 当前 ChatV2 |
+| Source column | Meaning / handling | Current ChatV2 |
 |---|---|---|
-| `username` | 源会话标识，不改前后缀 | `username` |
-| `unread_count` | 原整数；NULL 保持 null，0/负值不擅自补改 | `unread_count` |
-| `unread_first_msg_srv_id` | 首条未读消息的服务端 ID 字段 | 不输出 |
-| `unread_first_pat_msg_local_id` | 首条未读拍一拍消息的本地 ID 字段 | 不输出 |
-| `unread_first_pat_msg_sort_seq` | 首条未读拍一拍消息的排序值字段 | 不输出 |
-| `summary` | 源摘要，空串和 NULL 当前都归 null | `last_message_preview` |
-| `last_msg_sender` | **源原值**；可带 `_$_CUSTOM_USERNAME_PREFIX_$_…:…`，不拆成普通 username | `last_msg_sender` |
-| `last_sender_display_name` | 源显示标签，空串归 null | `last_sender_display_name` |
-| `last_timestamp` | 按 Unix 秒转换；正且可表示才返回 RFC3339，否则 null | `last_activity_at` |
-| `last_clear_unread_timestamp` | 最近清除未读的时间字段，单位待核 | 不输出 |
-| `last_msg_locald_id` | 源拼写含 locald；只修公开拼写，不变值 | `last_msg_local_id`，nullable JSON number；不是 server_id |
-| `last_msg_type` | 最近消息类型字段，具体与消息 packed 类型的对应待核 | 不输出 |
-| `last_msg_sub_type` | 最近消息子类型字段，具体取值对应待核 | 不输出 |
-| `last_msg_ext_type` | 最近消息扩展类型字段，枚举待核 | 不输出 |
-| `sort_timestamp` | 实际列表排序键，降序；置顶编码尚未核 | 不输出，不能等同 last_timestamp |
-| `is_hidden` | 当前仅取 0 | 筛选用，不输出 |
-| `type` | 遗留投影曾读取，完整枚举未确认 | 不输出 |
-| `draft` | 遗留投影曾读取，内容编码未核 | 不输出 |
-| `status` | 会话状态代码，枚举待核 | 不输出 |
+| `username` | Source conversation identifier; prefixes and suffixes are preserved | `username` |
+| `unread_count` | Original integer; NULL remains null, and zero/negative values are not adjusted | `unread_count` |
+| `unread_first_msg_srv_id` | Server ID field for the first unread message | Not exposed |
+| `unread_first_pat_msg_local_id` | Local ID field for the first unread nudge message | Not exposed |
+| `unread_first_pat_msg_sort_seq` | Sort value for the first unread nudge message | Not exposed |
+| `summary` | Source summary; both empty strings and NULL currently become null | `last_message_preview` |
+| `last_msg_sender` | **Original source value**; may contain `_$_CUSTOM_USERNAME_PREFIX_$_…:…`, and is not split into an ordinary username | `last_msg_sender` |
+| `last_sender_display_name` | Source display label; empty strings become null | `last_sender_display_name` |
+| `last_timestamp` | Converted as Unix seconds; returned as RFC3339 only if positive and representable, otherwise null | `last_activity_at` |
+| `last_clear_unread_timestamp` | Timestamp of the most recent unread-clear action; unit unverified | Not exposed |
+| `last_msg_locald_id` | Source spelling includes `locald`; only the public spelling is corrected, not the value | `last_msg_local_id`, nullable JSON number; not a server_id |
+| `last_msg_type` | Most recent message type field; relationship to packed message types is unverified | Not exposed |
+| `last_msg_sub_type` | Most recent message subtype field; exact value mapping is unverified | Not exposed |
+| `last_msg_ext_type` | Most recent message extension-type field; enum unverified | Not exposed |
+| `sort_timestamp` | Actual list sort key, descending; pinned-chat encoding is unverified | Not exposed; do not equate with `last_timestamp` |
+| `is_hidden` | Currently selects only 0 | Used for filtering; not exposed |
+| `type` | Read by a legacy projection; full enum unconfirmed | Not exposed |
+| `draft` | Read by a legacy projection; content encoding unverified | Not exposed |
+| `status` | Conversation status code; enum unverified | Not exposed |
 
-Chat 的 `display_name/remark/nick_name` 来自 contact 名称关联；没有 contact 资料也保留会话并回退 username。读会话列表不打开聊天、不清未读；它与联系人列表各自冻结，不能当作跨接口原子快照。`last_msg_local_id` 仍用 JSON number，超出 JS 安全整数是潜在限制，尚无已核超限样本。
+Chat `display_name/remark/nick_name` come from the contact-name join; conversations without contact details are retained and fall back to username. Reading the conversation list does not open chats or clear unread counts. It is frozen independently from the contact list and is not an atomic cross-endpoint snapshot. `last_msg_local_id` remains a JSON number, which may exceed JavaScript's safe-integer range; no such oversized value has been verified yet.
 
-## message_N.db：消息与身份
+## message_N.db: messages and identity
 
-### 表结构与关联
+### Schema and relationships
 
-当前实现按聊天 username 的 MD5 定位 `Msg_<32位十六进制>` 表，并跨合法编号 `message_N.db` 搜索。`real_sender_id` 通过该分片 `Name2Id.rowid` 关联 `Name2Id.user_name`；因此 API 的 sender_username 是有实际 JOIN 依据的转换，不是直接把数字字段改名。
+The current implementation uses the MD5 of the chat username to locate the `Msg_<32 hexadecimal characters>` table, searching across validly numbered `message_N.db` files. `real_sender_id` joins to `Name2Id.user_name` through that shard's `Name2Id.rowid`; therefore, the API's `sender_username` is based on an actual JOIN, not merely a renamed numeric field.
 
-`Msg_*` 表字段：
+`Msg_*` table fields:
 
-| 源字段 | 声明类型 | 含义／本项目处理 |
+| Source field | Declared type | Meaning / handling in this project |
 |---|---|---|
-| `local_id` | INTEGER PRIMARY KEY AUTOINCREMENT | 此表本地行身份，不是跨会话／分片全局消息身份 |
-| `server_id` | INTEGER | 微信原生消息标识；本项目在已登录账号范围内采用它作为唯一消息键及媒体定位依据 |
-| `local_type` | INTEGER | packed 消息类型；低／高 32 位分别投影 type/sub_type |
-| `sort_seq` | INTEGER | 源排序相关值；原生定位读为文本，具体生成／全局序号语义未确认 |
-| `real_sender_id` | INTEGER | JOIN 本分片 Name2Id 的 rowid，取得发送者 user_name |
-| `create_time` | INTEGER | 当前按 Unix 秒解释；不等于可信本机数据库提交时间 |
-| `status` | INTEGER | 状态枚举未确认，不据此宣称送达 |
-| `upload_status` | INTEGER | 上传状态枚举未确认 |
-| `download_status` | INTEGER | 下载状态枚举未确认 |
-| `server_seq` | INTEGER | 序号语义、与 server_id 的关系未确认 |
-| `origin_source` | INTEGER | 来源枚举未确认，不能据名字判断人工／自动 |
-| `source` | TEXT | 附加消息资料；当前解码后用于 atuserlist 等，不是展示正文 |
-| `message_content` | TEXT | 原始存储内容，可含文本、XML、压缩字节；不能按声明为 TEXT 就跳过解压 |
-| `compress_content` | TEXT | 已见列，未证其与 WCDB 压缩标志的关系；当前读取不依赖它 |
-| `packed_info_data` | BLOB | 已见列，完整格式未解析 |
-| `WCDB_CT_message_content` | INTEGER DEFAULT NULL | 实现按非零及 Zstd magic 决定正文解压；完整标志枚举未核 |
-| `WCDB_CT_source` | INTEGER DEFAULT NULL | source 的对应解码标记；不混正文标记 |
+| `local_id` | INTEGER PRIMARY KEY AUTOINCREMENT | Local row identity within this table, not a message identity global across conversations or shards |
+| `server_id` | INTEGER | Native WeChat message identifier; this project uses it as the unique message key and media locator within the logged-in account |
+| `local_type` | INTEGER | Packed message type; the low and high 32 bits are projected as `type` and `sub_type` respectively |
+| `sort_seq` | INTEGER | Source ordering-related value; native lookup reads it as text. Exact generation and global-sequence semantics are unconfirmed |
+| `real_sender_id` | INTEGER | Joins to this shard's `Name2Id.rowid` to obtain the sender's `user_name` |
+| `create_time` | INTEGER | Currently interpreted as Unix seconds; it is not a trusted local database commit time |
+| `status` | INTEGER | Status enum unconfirmed; do not use it to claim delivery |
+| `upload_status` | INTEGER | Upload-status enum unconfirmed |
+| `download_status` | INTEGER | Download-status enum unconfirmed |
+| `server_seq` | INTEGER | Sequence semantics and relationship to `server_id` are unconfirmed |
+| `origin_source` | INTEGER | Source enum unconfirmed; do not infer manual/automatic origin from the name |
+| `source` | TEXT | Additional message data; currently decoded for values such as `atuserlist`, not display content |
+| `message_content` | TEXT | Raw stored content may contain text, XML, or compressed bytes; do not skip decompression based only on the declared TEXT type |
+| `compress_content` | TEXT | Observed column; relationship to the WCDB compression flag is unverified, and current reads do not depend on it |
+| `packed_info_data` | BLOB | Observed column; format not fully parsed |
+| `WCDB_CT_message_content` | INTEGER DEFAULT NULL | The implementation decompresses content based on a nonzero value and Zstd magic; the complete flag enum is unverified |
+| `WCDB_CT_source` | INTEGER DEFAULT NULL | Corresponding decode marker for `source`; do not conflate it with the content marker |
 
-源表的 server_id 索引不是 UNIQUE 约束；业务层采用的唯一消息键与数据库声明约束分开。不同分片／数据库的 Name2Id.rowid 各自独立。
+The source table's `server_id` index is not a UNIQUE constraint; the unique message key used by business logic is separate from the database-declared constraint. `Name2Id.rowid` values are independent across shards/databases.
 
-### server_id、local_id 与 API 定位
+### `server_id`, `local_id`, and API lookup
 
-- **server_id**：对外十进制字符串，避免 JavaScript Number 丢精度。当前定位接口接受非零、可解析为 signed i64 的规范值；不取绝对值、不凭其它项目 uint64 声明改变本源类型。
-- **local_id**：对外也用字符串，但只是表内行定位。相同数字可以出现在不同聊天／分片；转为字符串只解决精度，不解决歧义。
-- 已核验的已登录账号 API 消息均有非零 server_id，且在已读取会话之间无重复；业务据此采用 server_id 消息键。
-- V2 对缺失／0 的消息 ID 输出 null；跨导入按原生消息身份关联，不按 local_id 或相同文本／时间猜合并。
-- `/api/v2/messages/{server_id}` 可加 `chat_username` 缩小范围；服务端在当前账号内查所有相关分片。多匹配明确报歧义，不取第一条；部分分片读取失败也不能装作不存在。
-- 媒体和原始语音沿同一内部源行锚点处理。不能先按 server_id 找到某个 local_id，再调用会任取首分片的旧路径。
-- 旧 CLI `<chat> <localId>` 只是兼容输入：完整分页找到唯一记录并释放样本，再使用其真实非零 server_id；无 ID、歧义、分页失败均不能伪造 ID。
+- **server_id**: Exposed as a decimal string to avoid JavaScript `Number` precision loss. Current lookup accepts canonical, nonzero values parseable as signed i64; it does not take absolute values or change the source type based on another project's `uint64` declaration.
+- **local_id**: Also exposed as a string, but only identifies a row within a table. The same number can occur in different chats/shards; converting it to a string solves precision loss, not ambiguity.
+- All verified API messages for the logged-in account have nonzero `server_id` values, with no duplicates across the conversations read; business logic therefore uses `server_id` as the message key.
+- V2 returns null for missing/zero message IDs. Cross-import matching uses native message identity, not `local_id` or guessed matches based on equal text/timestamps.
+- `/api/v2/messages/{server_id}` accepts optional `chat_username` to narrow the search; the server checks all relevant shards in the current account. Multiple matches return an explicit ambiguity error rather than the first result; a partial shard-read failure is not treated as proof of absence.
+- Media and raw voice use the same internal source-row anchor. Do not look up a `local_id` by `server_id` and then call an old path that arbitrarily selects the first shard.
+- The legacy CLI `<chat> <localId>` syntax is compatibility input only: complete pagination must find exactly one record and release the sample before using its actual nonzero `server_id`. Missing IDs, ambiguity, or pagination failure must not be handled by fabricating an ID.
 
-### 存储内容、压缩与方向
+### Stored content, compression, and direction
 
-| V2 字段 | 来源与语义 |
+| V2 field | Source and semantics |
 |---|---|
-| `raw_type` | 原 local_type 完整 i64 的十进制字符串，不截断 |
-| `type/sub_type` | raw_type 的低／高 unsigned 32 位，不与 contact.local_type 混用 |
-| `xml_sub_type` | 正文 appmsg/type 独立解析值；即使与 packed 子类型冲突，也不覆盖源值 |
-| `raw_content` | message_content **存储字节的十六进制**，不是整个 SQLCipher 数据库的密文，也不一定已解压 |
-| `raw_content_compression` | 与 raw_content 配套的必出 bool；缺失不是默认 false，解码方须保留 |
-| `content` | 解码、群前缀处理与展示清理后的内容，可能只剩标题／链接摘要，不是原字节替代品 |
-| `timestamp` | RFC3339 时间；超出可表示范围时为 null，源 create_time 缺失或非整数时采集报错 |
-| `sender_username` | Name2Id JOIN 得到的 user_name，缺关联可为 null |
-| `sender_display_name` | 联系人名称派生显示，不是原 real_sender_id |
-| `is_self` | 是否本账号发送的派生标记；现代码使用账号目录对 sender 的前缀匹配，见下节账号身份来源 |
-| `is_mentioned` | 群 atuserlist 命中为 true；未命中当前为 null，不是 false |
+| `raw_type` | Full original `local_type` as a decimal i64 string, without truncation |
+| `type/sub_type` | Low/high unsigned 32 bits of `raw_type`; do not conflate with `contact.local_type` |
+| `xml_sub_type` | Independently parsed from body `appmsg/type`; does not overwrite the source value even if it conflicts with the packed subtype |
+| `raw_content` | Hexadecimal **stored bytes** of `message_content`; not the ciphertext of the entire SQLCipher database, and not necessarily decompressed |
+| `raw_content_compression` | Required boolean paired with `raw_content`; absence does not default to false and must be preserved by decoders |
+| `content` | Content after decoding, group-prefix handling, and display cleanup; may contain only a title/link summary and is not a substitute for the original bytes |
+| `timestamp` | RFC3339 time; null if outside the representable range. Collection fails if source `create_time` is missing or non-integer |
+| `sender_username` | `user_name` obtained by the `Name2Id` JOIN; may be null if no match exists |
+| `sender_display_name` | Display name derived from contact fields, not the original `real_sender_id` |
+| `is_self` | Derived marker indicating whether the current account sent the message; current code prefix-matches the sender against the account directory. See the next section for the account identity source |
+| `is_mentioned` | True when a group `atuserlist` match is found; currently null when not found, not false |
 
-source 内容和正文各用自己的压缩标记；V2 保留正文原 hex/bool。create_time 是消息时间，不用于测量本机“写库→通知”的耗时。
+`source` and message content each have their own compression marker; V2 preserves the original content hex/boolean. `create_time` is message time and is not used to measure local “database write → notification” latency.
 
-### 当前登录账号与 is_self
+### Current logged-in account and `is_self`
 
-对外统一账号值是 **`GET /api/v2/account` 在 `status=logged_in` 时返回的 `account_username`**；其它状态该值为 null。`expected_account_username` 是调用方声明的账号意图，不是身份来源。
+The canonical account value exposed externally is **`account_username` returned by `GET /api/v2/account` when `status=logged_in`**; it is null in other states. `expected_account_username` expresses the caller's intended account; it is not an identity source.
 
-内部链路为：登录 session 记录 → 唯一微信进程及其打开的账号数据库目录 → `ReadIdentity.account_id` → `account_username`。当前 account_id 通过 `derive_account_id` 按账号目录名最后一个下划线分离安装后缀取得；账号接口还核对 UI 登录态及观察前后 scope。
+The internal chain is: login session record → unique WeChat process and its open account database directory → `ReadIdentity.account_id` → `account_username`. Current `account_id` is derived by `derive_account_id`, which removes the installation suffix after the last underscore in the account directory name. The account endpoint also checks UI login state and the scope before and after observation.
 
-`sender_username` 则来自消息分片的 Name2Id 映射。现有 `is_self` 使用 `account_dir.starts_with(sender)`，没有采用 sender_username 与 account_username 的精确相等判断。这是现有实现的精度缺口，不能反过来拿 is_self 证明账号身份；也没有已验证、独立于目录命名的原生 self 字段可替代。该文档更新不修改运行中的方向判定。
+`sender_username` comes from the message shard's `Name2Id` mapping. Current `is_self` uses `account_dir.starts_with(sender)` rather than exact equality between `sender_username` and `account_username`. This is a precision limitation in the current implementation; `is_self` must not be used as proof of account identity. No native self field independent of directory naming has been verified as a substitute. This documentation update does not change runtime direction detection.
 
-**filehelper：**精确 username 为 `filehelper`、kind 为 system。手机人工发送和程序发送都可以是当前账号 sender、is_self=true；is_self 不区分人工与自动。已确认 outbox 按账号＋chat＋server_id 去除本程序回采，未匹配保持来源未归属。ClawBot 使用账号对应的完整 `@weclaw` 标识，不按昵称或固定整个 username 跨账号匹配。
+**filehelper:** Its exact username is `filehelper` and its kind is system. Both messages manually sent from the phone and messages sent by the program can have the current account as sender and `is_self=true`; `is_self` does not distinguish manual from automated sends. The outbox is confirmed to suppress this program's own echoes by account + chat + server_id; unmatched messages remain unattributed. ClawBot uses the complete account-specific `@weclaw` identifier and is not matched across accounts by nickname or a fixed full username.
 
-### 三套消息类型字典
+### Three message-type dictionaries
 
-唯一代码字典为 `packages/agent-server-rust/src/message-type-dictionary.json`，经 `/api/v2/message-types` 返回并生成 shared/CLI 标签；未知数字继续保留。下面是当前收录范围，不是封闭枚举。
+The single code dictionary is `packages/agent-server-rust/src/message-type-dictionary.json`, returned by `/api/v2/message-types` and used to generate shared/CLI labels; unknown numeric values are preserved. The following is the currently covered range, not a closed enum.
 
-| 命名空间 | 数值与标签 |
+| Namespace | Values and labels |
 |---|---|
-| 主类型 `type` | 1 文本；3 图片；34 语音；37 好友申请详情；42 名片；43 视频；47 表情包；48 位置；49 应用消息；50 通话；51 状态同步；64 群通话邀请；10000 系统提示；10001 交互／安全提示；10002 撤回通知 |
-| 应用 XML 类型 `appmsg/type` | 3 音乐；4 视频链接；5 链接；6 文件；19 合并转发；33、36 小程序；57 引用；62 拍一拍 |
-| 转发内条目 `datatype` | 1 文本（已收录）；其它数字不丢弃、不冒充主消息类型 |
+| Main type `type` | 1 text; 3 image; 34 voice; 37 friend-request details; 42 contact card; 43 video; 47 sticker; 48 location; 49 app message; 50 call; 51 status sync; 64 group-call invitation; 10000 system notice; 10001 interaction/security notice; 10002 revoke notice |
+| App XML type `appmsg/type` | 3 music; 4 video link; 5 link; 6 file; 19 merged forward; 33, 36 mini program; 57 quote; 62 nudge |
+| Forwarded entry `datatype` | 1 text (included); other numeric values are retained and not misrepresented as main message types |
 
-字典 `basis` 区分 `default_adopted` 与 `local_observed`：当前主类型条目为前者；应用 57、转发内 1 为后者。其它应用条目默认采用，不等于全部经过现场验证。应用 1／24 的完整语义仍未确认；24 可能采用 recorditem 结构，也不能直接宣称等同已支持的 19。应用 4 不能因展示包含 URL 就改成应用 5。
+The dictionary's `basis` distinguishes `default_adopted` from `local_observed`: current main-type entries use the former; app type 57 and forwarded-entry type 1 use the latter. Other app entries are adopted by default, which does not mean all have been verified against a live client. The full semantics of app types 1 and 24 remain unconfirmed; type 24 may use a `recorditem` structure and cannot be declared equivalent to the supported type 19. App type 4 must not be reclassified as type 5 merely because its display includes a URL.
 
-### 引用与合并转发 XML
+### Quote and merged-forward XML
 
-| 源 XML | API／解释 |
+| Source XML | API / interpretation |
 |---|---|
-| `refermsg/svrid` | `reference.server_id` 字符串原值；可能为 `"0"`，不等于可用于非零 ID 查询 |
-| `refermsg/chatusr` | `reference.sender_username`，被引用作者；缺失不猜外层作者 |
-| `refermsg/fromusr` | 群引用会话来源；当前群缺失时回退所在群，单聊用当前 chat，输出 `reference.chat_username` |
-| `refermsg/displayname` | 引用当时显示名，不能用今天的联系人备注覆盖 |
-| `refermsg/content` | XML 解析所得文本，保留引用内容，不承诺深层消息的完整展示还原 |
-| `recorditem` | 外 XML 的文本中可嵌入 recordinfo XML；按层解析一次，处理 CDATA／转义，不反复全局 unescape |
-| `recordinfo/datalist/dataitem` | 有序转发条目；外层转发者不是每条内消息的作者 |
-| `dataitem` 的 `datatype/dataid` 属性 | 保条目类型与 ID；datatype 属独立命名空间 |
-| `datadesc/sourcename/sourceheadurl/sourcetime` | 原文本／当时显示名／头像来源／展示时间；URL不自动下载，时间不猜时区 |
-| `srcMsgCreateTime/fromnewmsgid` | `src_msg_create_time/from_new_msg_id` 字符串；内消息不保证存在于当前账号消息库 |
-| `dataitemsource/hashusername` | `dataitem_source_hash_username` 原值，不把 hash 或显示名冒充真实 username |
+| `refermsg/svrid` | Original string value in `reference.server_id`; may be `"0"`, which is not a usable nonzero ID for lookup |
+| `refermsg/chatusr` | `reference.sender_username`, the quoted author; do not guess the outer author if absent |
+| `refermsg/fromusr` | Source conversation for a group quote; falls back to the current group if absent, while direct chats use the current chat. Exposed as `reference.chat_username` |
+| `refermsg/displayname` | Display name at the time of the quote; do not replace it with the contact's current remark |
+| `refermsg/content` | Text parsed from XML; quote content is retained, but complete rendering of deeply nested messages is not guaranteed |
+| `recorditem` | `recordinfo` XML may be embedded in the outer XML text; parse one layer at a time, handling CDATA/escaping without repeatedly applying global unescape |
+| `recordinfo/datalist/dataitem` | Ordered forwarded entries; the outer forwarder is not the author of every inner message |
+| `dataitem` attributes `datatype/dataid` | Preserve entry type and ID; `datatype` belongs to a separate namespace |
+| `datadesc/sourcename/sourceheadurl/sourcetime` | Original text / display name at the time / avatar source / display time; URLs are not downloaded automatically and time zones are not inferred |
+| `srcMsgCreateTime/fromnewmsgid` | Strings exposed as `src_msg_create_time/from_new_msg_id`; inner messages are not guaranteed to exist in the current account database |
+| `dataitemsource/hashusername` | Original value exposed as `dataitem_source_hash_username`; do not present a hash or display name as a real username |
 
-当前仅对已支持结构返回 `forwarded_record`，`parse_status` 为 complete/truncated/invalid。输入 4 MiB、深度 16、节点 20,000、条目 100、datadesc 64 KiB 有界；datadesc 限制在文本物化后检查，不是分配前内存上限。禁 DTD／外部实体；未知结构、重复单值等不能静默丢弃后报 complete。内条目不会被自动当作独立新来信执行。
+`forwarded_record` is returned only for supported structures; `parse_status` is complete/truncated/invalid. Limits are 4 MiB input, depth 16, 20,000 nodes, 100 entries, and 64 KiB for `datadesc`. The `datadesc` limit is checked after text materialization and is not a pre-allocation memory limit. DTD/external entities are prohibited; unknown structures or duplicate single-value elements must not be silently discarded and reported as complete. Inner entries are never automatically executed as independent incoming messages.
 
-## 媒体库与文件索引
+## Media databases and file indexes
 
-以下是**源码已使用列**；没有完整真实 schema 证据的表，不补写其它列。
+The following are **columns used by the source code**. No additional columns are listed for tables without evidence of their complete actual schema.
 
-| 库／表 | 字段 | 关联与内容 |
+| Database / table | Fields | Relationships and contents |
 |---|---|---|
-| `media_N.db / Name2Id` | `user_name, rowid` | 用 chat username 找本媒体分片自己的会话行号 |
-| `media_N.db / VoiceInfo` | `chat_name_id` | 对应本媒体库 Name2Id.rowid，不是消息分片的 sender rowid |
-| 同上 | `svr_id` | 原始语音路径以消息 server_id 匹配此值 |
-| 同上 | `local_id` | 既有通用媒体实现中还有 local_id 查询路径；不因此把 local_id 解释为全局身份，也不以该路径否定已验 svr_id 路径 |
-| 同上 | `create_time` | 原始语音锚点一致性复核用 |
-| 同上 | `voice_data, rowid` | 音频 BLOB 及媒体行定位；专用 voice 返回 SILK，通用媒体可能转换 MP3 |
-| `message_resource.db / ChatName2Id` | `user_name, rowid` | chat username → 此资源库内部 chat ID |
-| `MessageResourceInfo` | `chat_id, message_local_id` | 资源库 chat ID＋消息本地 ID 定位资源记录 |
-| 同上 | `packed_info` | 二进制资源资料；当前解析提取文件 hash，完整布局未解析 |
-| `hardlink.db / image_hardlink_info_v4` | `md5, file_name, dir1, dir2` | 按消息 XML md5 查询候选文件名及目录键 |
-| `hardlink.db / dir2id` | `rowid, username` | 目录键→路径组件；这里的 username 不能直接解释成联系人账号 |
+| `media_N.db / Name2Id` | `user_name, rowid` | Find this media shard's conversation row ID using the chat username |
+| `media_N.db / VoiceInfo` | `chat_name_id` | Refers to `Name2Id.rowid` in this media database, not the sender row ID in a message shard |
+| Same | `svr_id` | The raw-voice path matches this value against the message `server_id` |
+| Same | `local_id` | The existing generic media implementation also has a `local_id` lookup path; this does not make `local_id` a global identity or invalidate the verified `svr_id` path |
+| Same | `create_time` | Used to recheck consistency of the raw-voice anchor |
+| Same | `voice_data, rowid` | Audio BLOB and media-row locator; the dedicated voice endpoint returns SILK, while generic media may convert to MP3 |
+| `message_resource.db / ChatName2Id` | `user_name, rowid` | chat username → internal chat ID in this resource database |
+| `MessageResourceInfo` | `chat_id, message_local_id` | Resource record located by resource-database chat ID + local message ID |
+| Same | `packed_info` | Binary resource metadata; current parsing extracts the file hash, but the full layout is not parsed |
+| `hardlink.db / image_hardlink_info_v4` | `md5, file_name, dir1, dir2` | Look up candidate filenames and directory keys using the message XML MD5 |
+| `hardlink.db / dir2id` | `rowid, username` | Directory key → path component; do not interpret this `username` directly as a contact account |
 
-消息与媒体分片中的 Name2Id 行号各自独立。`server_id→svr_id` 是原始语音的已核关联；它不要求调用方再提供 chat_name_id，也不证明内部会话条件可以删除。
+`Name2Id` row IDs in message and media shards are independent. `server_id → svr_id` is a verified raw-voice relationship; callers do not need to provide `chat_name_id`, and this does not prove internal conversation conditions can be removed.
 
-图片常见 `_t.dat` 缩略、`.dat` 标准、`_h.dat` 原件候选；后缀不保证字节完整或客户端已下载。文件消息通过 XML title/fileext 及长度／MD5核验本地附件；索引命中不等于文件已落盘。视频结果可能只有 JPEG 封面／缩略图，位置消息可返回地图预览；`type=video` 不保证 data 是视频本体，缺 quality 不保证原件。location 的坐标／地点仍可在内容 XML 中，当前不是独立结构化位置对象。
+Common image candidates use `_t.dat` for thumbnails, `.dat` for standard images, and `_h.dat` for originals; suffixes do not guarantee complete bytes or that the client downloaded the file. File-message attachments are checked locally using XML title/fileext and size/MD5; an index match does not mean the file is present on disk. Video results may contain only a JPEG cover/thumbnail, and location messages may return a map preview; `type=video` does not guarantee that `data` is the video itself, and an omitted quality does not guarantee the original. Location coordinates/place may remain in content XML and are not currently exposed as an independent structured location object.
 
-媒体 `pending` 表示暂不可交付，不伪装空 image 成功；`unsupported` 也可能表示账号／消息不可用，不能直接推微信不支持。原生传输及等待行为以 API 文档为准，不能把资源表或消息里的下载参数自动解释为可用下载地址。
+Media `pending` means it cannot be delivered yet; an empty image is not reported as success. `unsupported` may also mean the account/message is unavailable and does not by itself prove WeChat lacks support. See the API documentation for native-transfer and wait behavior; download parameters in resource tables or messages must not automatically be treated as usable URLs.
 
-## 源数据库、WAL 与两种快照
+## Source databases, WAL, and two kinds of snapshots
 
-微信 DB 为 SQLCipher 密文。当前 reader 只以普通只读文件方式采集源 DB/WAL 字节，不以 SQLite 连接活微信源库、不复制源 SHM；SQLCipher 打开私有密文镜像。WAL 仅合并标准盐、校验链及提交边界通过的前缀；坏前缀之外的物理残留不自动认作有效提交，也不能据此说所有近期消息均已找到。
+WeChat databases are SQLCipher-encrypted. The current reader collects source DB/WAL bytes as ordinary read-only files; it does not connect to the live WeChat source with SQLite or copy the source SHM. SQLCipher opens a private encrypted mirror. WAL merging includes only the prefix that passes standard salt, checksum-chain, and commit-boundary validation. Physical remnants beyond an invalid prefix are not automatically treated as valid commits; this also does not prove that all recent messages have been found.
 
-| 机制 | 保存什么 | 生命周期与预算 |
+| Mechanism | What is retained | Lifetime and budget |
 |---|---|---|
-| 源隔离镜像复用 | 私有密文完整镜像，非持久明文库 | 源 DB/WAL 文件信息及 key 未变则复用，变化重建；各请求独立连接，4项缓存；单次处理预算 512 MiB，不是进程 RSS 上限或允许 512 MiB 主库 |
-| API 冻结分页 | 已采集的内存行集合 | TTL 300 秒不续期、4槽、每样本50,000行/16 MiB、总32 MiB、每页3 MiB；续页不重扫源，释放删除内存样本而非源文件 |
+| Reuse of isolated source mirror | Complete private encrypted mirror, not a persistent plaintext database | Reused while source DB/WAL metadata and keys remain unchanged; rebuilt when they change. Independent connection per request; four-entry cache. Per-operation processing budget is 512 MiB, not a process RSS limit or permission for a 512 MiB main database |
+| API frozen pagination | In-memory set of collected rows | Nonrenewable 300-second TTL, four slots, 50,000 rows/16 MiB per sample, 32 MiB total, 3 MiB per page. Continuations do not rescan the source; release deletes the in-memory sample, not source files |
 
-`data_changed` 只是 DB/WAL 文件变化提示，可早于事务提交，不是带消息 ID 的可靠消息队列。当前采用源隔离；曾试用的直接 SQL 读取路线已停止，不能因通用 SQLite 合成测试通过就恢复活源直读。
+`data_changed` is only a DB/WAL file-change hint and may occur before transaction commit; it is not a reliable message queue with message IDs. The current implementation uses source isolation. The previously tried direct-SQL read path has been discontinued; passing generic synthetic SQLite tests is not a reason to resume direct reads from a live source.
 
-## 依据与维护边界
+## Evidence and maintenance boundaries
 
-当前字段实现入口：`tools/wechat_contacts.rs`、`wechat_group_members.rs`、`wechat_chats.rs`、`wechat_messages.rs`、`message_record.rs`、`wechat_media.rs`、`wechat_read_voice.rs`；对外类型以 `ia/types.rs`、路由以 `router/read_v2.rs` 为准（均在 `packages/agent-server-rust/src/`）。数据库源字段、API 派生字段、下游业务判断必须分开记录。
+Current field implementation entry points: `tools/wechat_contacts.rs`, `wechat_group_members.rs`, `wechat_chats.rs`, `wechat_messages.rs`, `message_record.rs`, `wechat_media.rs`, and `wechat_read_voice.rs`. Public types are defined in `ia/types.rs`, and routes in `router/read_v2.rs` (all under `packages/agent-server-rust/src/`). Keep database source fields, API-derived fields, and downstream business decisions documented separately.
 
-本页汇总已有安全副本和源码核查，没有为编写文档连接活源或改变好友关系。以后补字段时同时说明客户端版本、真实 schema／实际值类型、语义依据及是否只是样本推断。尚未核验的库和字段保留“未确认”，不将有限副本包装成完整官方协议。
+This page summarizes existing safe copies and source-code review; no live source was accessed and no friendship relationships were changed to write it. When adding fields, state the client version, actual schema/runtime value types, semantic evidence, and whether a claim is inferred only from samples. Keep unverified databases and fields marked “unconfirmed”; do not present limited copies as a complete official protocol.
 
-## 读取与导出
+## Reading and exporting
 
-### 通过 API／CLI
+### Through the API/CLI
 
-优先使用现有 API／CLI：
+Prefer the existing API/CLI:
 
 ```bash
-# 会话列表
+# Conversation list
 wx chats list --json
 
-# 消息
+# Messages
 wx messages list <chatId> --json
 
-# 按原生消息 ID 读取媒体
+# Retrieve media by native message ID
 wx messages media <chatId> --server-id <serverId> --output photo.jpg
 ```
 
-### 通过 Docker 卷取文件
+### Access files through Docker volumes
 
-下面仅是文件访问命令，**不是运行中数据库的一致备份**。历史迁移前协调两卷和关联业务账本的一致备份，见 [使用指南](/operations/user-guide#desktop-access-and-history-import)。应核实真实挂载，不把示例卷名当所有部署的配置。
+The following are file-access commands only, **not a consistent backup of a running database**. Before history migration, coordinate consistent backups of both volumes and the associated application ledger; see [User Guide](/operations/user-guide#desktop-access-and-history-import). Verify the actual mounts; the example volume names do not apply to every deployment.
 
 ```bash
-# 查看卷
+# Inspect a volume
 docker volume inspect agent-wechat-data
 
-# 从容器复制文件
+# Copy files from the container
 docker cp agent-wechat:/data/agent.db ./agent.db
 docker cp agent-wechat:/home/wechat/ ./wechat-data/
 ```
 
-### 通过 VNC 观察
+### Observe through VNC
 
-使用带认证 token 的 `http://localhost:6174/vnc/` 查看微信界面；文件存在、API 返回和客户端实际呈现是不同层次的证据。
+Use `http://localhost:6174/vnc/` with an authenticated token to view the WeChat interface. File presence, API responses, and what the client actually displays are different levels of evidence.
 
-## 磁盘空间
+## Disk space
 
-消息、媒体和缓存会随使用增长，可查看卷占用：
+Messages, media, and caches grow with use. Check volume usage with:
 
 ```bash
 docker system df -v | grep agent-wechat
 ```
 
-空间不足时见 [磁盘空间排查](/reference/troubleshooting#disk-space)。
+For low disk space, see [Disk space troubleshooting](/reference/troubleshooting#disk-space).
