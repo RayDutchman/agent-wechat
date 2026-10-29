@@ -38,8 +38,8 @@ pnpm --filter @agent-wechat/cli build
 node packages/cli/dist/cli.js --help
 alias wx='node packages/cli/dist/cli.js'
 
-# Pull the Linux AMD64 image, then complete Docker Setup below before login
-docker pull ghcr.io/raydutchman/agent-wechat:2026.10.22
+# Pull the image for your platform, then complete Docker Setup below before login
+docker pull ghcr.io/raydutchman/agent-wechat:2026.10.29
 
 # Login (displays QR code in terminal)
 wx auth login
@@ -118,7 +118,7 @@ Local Compose lifecycle configuration is described in the [CLI container guide](
 
 **Docker Compose**
 
-The repository's [`docker-compose.yml`](./docker-compose.yml) uses host networking. The published `2026.10.22` image is available for AMD64 and ARM64 and passed startup smoke checks, which do not verify login or account data. It is not a fixed-WeChat-4.1.13.23 build: its tested AMD64 image contains 4.1.13.26, and the older helper produced `keys_unavailable`, so it is not recommended as a fully account-usable release. The fixed-package build is a candidate and has not been published. See the [Compose deployment guide](./docs/src/content/docs/getting-started/container-setup/docker-compose.mdx) for build and deployment details.
+The repository's [`docker-compose.yml`](./docker-compose.yml) uses host networking. The published `2026.10.29` image pins WeChat 4.1.13.23 for AMD64 and ARM64. Both architecture images passed isolated startup smoke checks; these do not verify login or account-data behavior. This release replaces the previous image's unpinned package download. See the [Compose deployment guide](./docs/src/content/docs/getting-started/container-setup/docker-compose.mdx) for build and deployment details.
 
 ## Documentation
 

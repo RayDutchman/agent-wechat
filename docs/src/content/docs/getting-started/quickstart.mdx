@@ -3,7 +3,7 @@ title: Quick Start
 description: Get agent-wechat running in under 5 minutes.
 ---
 
-This repository is a fork; upstream packages, documentation, and images are not necessarily compatible. Build the CLI from this source and choose a compatible image, or build locally with the fixed WeChat package described below. Fixed-package source builds support verified WeChat 4.1.13.23 archives for AMD64 and ARM64. The published `2026.10.22` dual-architecture image remains available, but is not the fixed-package build: its tested AMD64 image contains WeChat 4.1.13.26 and its older helper produced `keys_unavailable`. Startup smoke checks do not verify login or account data, so do not rely on that image for full account use. The fixed-package image is a candidate, not yet a new release.
+This repository is a fork; upstream packages, documentation, and images are not necessarily compatible. Build the CLI from this source and use the published `2026.10.29` image, or build locally with the fixed WeChat package. Both AMD64 and ARM64 images pin WeChat 4.1.13.23 and passed isolated startup smoke checks; those checks do not verify login or account-data behavior.
 
 :::note[Prerequisites]
 You need **Docker** running on your machine. On macOS, install [Colima](https://github.com/abiosoft/colima) (`brew install colima && colima start`) or [Docker Desktop](https://www.docker.com/products/docker-desktop/). On Linux, install [Docker Engine](https://docs.docker.com/engine/install/).
@@ -25,7 +25,7 @@ Use `node packages/cli/dist/cli.js <command> ...` or define the shown shell alia
 
 ## 2. Prepare and start the container
 
-The published `ghcr.io/raydutchman/agent-wechat:2026.10.22` image is available for Linux AMD64 and ARM64, but has the limitations above. For fixed-package source builds, provide the verified WeChat 4.1.13.23 `.deb` for your architecture before building; see [Docker Compose setup](/getting-started/container-setup/docker-compose). The default `wx up` image may not contain this fork's server.
+The published `ghcr.io/raydutchman/agent-wechat:2026.10.29` image is available for Linux AMD64 and ARM64. For source builds, provide the verified WeChat 4.1.13.23 `.deb` for your architecture before building; see [Docker Compose setup](/getting-started/container-setup/docker-compose). The default `wx up` image may not contain this fork's server.
 
 When reusing account data, retain its existing token and volume names; do not replace the token. You can use the built CLI below for API interaction after the server is running.
 
