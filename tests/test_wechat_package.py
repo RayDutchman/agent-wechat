@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).parents[1]
 VERIFY = ROOT / "docker/verify-wechat-package.sh"
 DOWNLOAD = ROOT / "scripts/download-wechat.sh"
 ARCHIVE = os.environ.get("WECHAT_TEST_DEB_PATH")
+ARM64_ARCHIVE = os.environ.get("WECHAT_TEST_ARM64_DEB_PATH")
 TEMP_ROOT = ROOT / "tmp"
 
 
@@ -28,7 +29,7 @@ class WechatPackageTests(unittest.TestCase):
 
     def test_unknown_architecture_fails(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as tmp:
-            result = self.run_command([str(VERIFY), "4.1.13.23", "arm64", str(pathlib.Path(tmp) / "wechat.deb")])
+            result = self.run_command([str(VERIFY), "4.1.13.23", "riscv64", str(pathlib.Path(tmp) / "wechat.deb")])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported", result.stderr.lower())
 
@@ -61,6 +62,25 @@ class WechatPackageTests(unittest.TestCase):
             result = self.run_command(["bash", str(DOWNLOAD)], env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(output.exists())
+
+    def test_valid_arm64_archive_is_copied_to_docker_context(self):
+        if not ARM64_ARCHIVE:
+            self.skipTest("approved ARM64 archive is not available")
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as tmp:
+            output = pathlib.Path(tmp) / "docker/wechat.deb"
+            env = os.environ.copy()
+            env.update(WECHAT_ARCH="arm64", WECHAT_DEB_PATH=ARM64_ARCHIVE, WECHAT_DEB_OUTPUT=str(output))
+            result = self.run_command(["bash", str(DOWNLOAD)], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hashlib.sha256(output.read_bytes()).digest(),
+                             hashlib.sha256(pathlib.Path(ARM64_ARCHIVE).read_bytes()).digest())
+
+    def test_amd64_archive_is_rejected_for_arm64(self):
+        if not ARCHIVE:
+            self.skipTest("approved local archive is not available")
+        result = self.run_command([str(VERIFY), "4.1.13.23", "arm64", ARCHIVE])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sha256", result.stderr.lower())
 
     def test_existing_invalid_package_is_not_overwritten(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as tmp:
