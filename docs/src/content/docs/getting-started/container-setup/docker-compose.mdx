@@ -3,18 +3,18 @@ title: Docker Compose
 description: Run agent-wechat with Docker Compose for production or networked setups.
 ---
 
-The published `ghcr.io/raydutchman/agent-wechat:2026.10.22` image remains available for Linux AMD64 and ARM64. Both platforms passed isolated startup smoke checks only; this does not establish login or account-data behavior. The tested AMD64 image contains WeChat 4.1.13.26 and its older helper produced `keys_unavailable`, so it is not recommended for full account use. This published image has not been replaced by the fixed-package candidate. Pull explicitly before starting Compose, which does not pull automatically.
+The published `ghcr.io/raydutchman/agent-wechat:2026.10.29` image pins WeChat 4.1.13.23 for Linux AMD64 and ARM64. Both platforms passed isolated startup smoke checks; these do not establish login or account-data behavior. Pull explicitly before starting Compose, which does not pull automatically.
 
 ## Fixed WeChat package source builds
 
-The fixed package is WeChat 4.1.13.23 for AMD64 or ARM64. `docker/verify-wechat-package.sh` verifies SHA-256 and package metadata for each architecture. Place the exact `.deb` at `docker/wechat.deb` by either setting `WECHAT_DEB_PATH` to a local package (the build runs `bash scripts/download-wechat.sh` to validate and stage it), or setting CI variables `WECHAT_DEB_AMD64_URL` and `WECHAT_DEB_ARM64_URL` to archive locations. The URLs only locate the archives; they are not trust checks—the packages must pass pinned checksum and metadata verification. Missing packages, invalid packages, and unsupported architectures fail the build; there is no fallback download of the latest package. The fixed-package build is a candidate and has not yet been released.
+The fixed package is WeChat 4.1.13.23 for AMD64 or ARM64. `docker/verify-wechat-package.sh` verifies SHA-256 and package metadata for each architecture. Place the exact `.deb` at `docker/wechat.deb` by either setting `WECHAT_DEB_PATH` to a local package (the build runs `bash scripts/download-wechat.sh` to validate and stage it), or setting CI variables `WECHAT_DEB_AMD64_URL` and `WECHAT_DEB_ARM64_URL` to archive locations. The URLs only locate the archives; they are not trust checks—the packages must pass pinned checksum and metadata verification. Missing packages, invalid packages, and unsupported architectures fail the build; there is no fallback download of the latest package.
 
 ```bash
 WECHAT_DEB_PATH=/path/to/wechat_4.1.13.23_amd64.deb pnpm build:image:amd64
 ```
 
 ```bash
-docker pull ghcr.io/raydutchman/agent-wechat:2026.10.22
+docker pull ghcr.io/raydutchman/agent-wechat:2026.10.29
 ```
 
 The repository root `docker-compose.yml` is the canonical host-network deployment. It requires a verified local image, existing external data/home volumes, and an existing token file. For a new standalone deployment, create those resources first; never regenerate the token when reusing existing account data.
@@ -22,7 +22,7 @@ The repository root `docker-compose.yml` is the canonical host-network deploymen
 ## 1. Prepare deployment settings
 
 ```dotenv
-AGENT_WECHAT_IMAGE=ghcr.io/raydutchman/agent-wechat:2026.10.22
+AGENT_WECHAT_IMAGE=ghcr.io/raydutchman/agent-wechat:2026.10.29
 AGENT_WECHAT_TOKEN_FILE=/absolute/path/to/token
 AGENT_WECHAT_DATA_VOLUME=agent-wechat-data
 AGENT_WECHAT_HOME_VOLUME=agent-wechat-home
