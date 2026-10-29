@@ -20,6 +20,9 @@ concurrency:
 jobs:
   smoke:
     name: Smoke (${{ matrix.arch }})
+    # Without both verified package archives, source-image smoke is skipped;
+    # this does not count as verification of any already-published image.
+    if: vars.WECHAT_DEB_AMD64_URL != '' && vars.WECHAT_DEB_ARM64_URL != ''
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +37,13 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare pinned WeChat package
+        env:
+          WECHAT_ARCH: ${{ matrix.arch }}
+          WECHAT_DEB_AMD64_URL: ${{ vars.WECHAT_DEB_AMD64_URL }}
+          WECHAT_DEB_ARM64_URL: ${{ vars.WECHAT_DEB_ARM64_URL }}
+        run: bash scripts/download-wechat.sh
 
       - name: Prepare Docker context
         run: |

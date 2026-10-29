@@ -35,6 +35,7 @@ services:
       WECHAT_LOCALE: ${WECHAT_LOCALE:-C.UTF-8}
       TZ: ${TZ:-UTC}
       ENABLE_VNC: ${ENABLE_VNC:-1}
+      WECHAT_NATIVE_MEDIA_DOWNLOAD: "${WECHAT_NATIVE_MEDIA_DOWNLOAD:-true}"
     restart: unless-stopped
 
 volumes:
