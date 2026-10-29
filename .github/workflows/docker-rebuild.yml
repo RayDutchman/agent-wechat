@@ -4,12 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag (e.g. 0.2.2). Also tags :latest."
+        description: "Image version tag (e.g. 0.2.2); normal builds also update :latest."
         required: true
       no-cache:
-        description: "Skip Docker layer cache (re-downloads WeChat)"
+        description: "Skip Docker layer cache"
         type: boolean
         default: false
+      existing_digest:
+        description: "Verify and publish an existing amd64 image digest instead of building"
+        type: string
+        required: false
+        default: ""
 
 concurrency: docker-rebuild
 
@@ -19,6 +24,7 @@ permissions:
 
 jobs:
   build:
+    if: inputs.existing_digest == ''
     name: Build (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -34,6 +40,13 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare pinned WeChat package
+        env:
+          WECHAT_ARCH: ${{ matrix.arch }}
+          WECHAT_DEB_AMD64_URL: ${{ vars.WECHAT_DEB_AMD64_URL }}
+          WECHAT_DEB_ARM64_URL: ${{ vars.WECHAT_DEB_ARM64_URL }}
+        run: bash scripts/download-wechat.sh
 
       - name: Prepare Docker context
         run: |
@@ -64,6 +77,7 @@ jobs:
         with:
           context: docker
           platforms: ${{ matrix.platform }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           no-cache: ${{ inputs.no-cache }}
           outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -94,6 +108,7 @@ jobs:
           retention-days: 1
 
   manifest:
+    if: inputs.existing_digest == ''
     name: Manifest
     needs: build
     runs-on: ubuntu-latest
@@ -130,3 +145,62 @@ jobs:
             -t "${IMAGE}:${VERSION}" \
             -t "${IMAGE}:latest" \
             "${refs[@]}"
+
+  publish-existing-amd64:
+    name: Verify and publish existing amd64 image
+    if: inputs.existing_digest != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate digest and version
+        env:
+          DIGEST: ${{ inputs.existing_digest }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid sha256 digest" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,121}-amd64$ ]] || { echo "Version must be a safe tag ending in -amd64" >&2; exit 1; }
+
+      - name: Resolve image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Pull and verify exact amd64 digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ inputs.existing_digest }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}@${DIGEST}"
+          docker pull --platform linux/amd64 "$REF"
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$REF")" == "linux/amd64" ]]
+          [[ "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$REF")" == "$GITHUB_SHA" ]]
+          docker run --rm --network none --entrypoint bash "$REF" -ceu '
+            test "$(dpkg-query -W -f="\${Version}" wechat)" = 4.1.13.23
+            readelf -n /opt/wechat/wechat | grep -F "Build ID: ce28c3471d532eeb1f136482eeb4d0bdfd59c06e"
+          '
+          bash scripts/smoke-image-startup.sh "$REF"
+
+      - name: Publish verified amd64 version tag
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ inputs.existing_digest }}
+          VERSION: ${{ inputs.version }}
+        run: docker buildx imagetools create --prefer-index=false -t "${IMAGE}:${VERSION}" "${IMAGE}@${DIGEST}"
+
+      - name: Record verified digest
+        env:
+          DIGEST: ${{ inputs.existing_digest }}
+          VERSION: ${{ inputs.version }}
+        run: echo "Published ${VERSION} from verified digest ${DIGEST} (amd64 only; latest unchanged)." >> "$GITHUB_STEP_SUMMARY"

@@ -101,21 +101,14 @@ RUN cd /tmp \
 RUN mkdir -p /tmp/.X11-unix && chown root:root /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 # ============================================
-# WeChat
-# If docker/wechat.deb exists in the build context, it is used directly.
-# Otherwise the .deb is downloaded at build time (CI path).
-# Run `pnpm download:wechat` to cache locally for faster builds.
+# WeChat (fixed, verified local archive; no build-time download fallback)
 # ============================================
 ARG TARGETARCH
-COPY wechat.de[b] /tmp/
-RUN if [ -f /tmp/wechat.deb ]; then \
-      echo "Installing WeChat from local .deb"; \
-    else \
-      ARCH_SUFFIX=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "x86_64") \
-      && echo "Downloading WeChat for ${ARCH_SUFFIX}..." \
-      && curl -L -o /tmp/wechat.deb "https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_${ARCH_SUFFIX}.deb"; \
-    fi \
-    && (dpkg -i /tmp/wechat.deb || (apt-get update && apt-get install -y -f)) \
+COPY wechat.deb /tmp/wechat.deb
+COPY verify-wechat-package.sh /usr/local/bin/verify-wechat-package
+RUN /usr/local/bin/verify-wechat-package 4.1.13.23 "$TARGETARCH" /tmp/wechat.deb \
+    && apt-get update \
+    && apt-get install -y /tmp/wechat.deb \
     && rm -rf /var/lib/apt/lists/* /tmp/wechat.deb
 
 RUN useradd -m -s /bin/bash wechat

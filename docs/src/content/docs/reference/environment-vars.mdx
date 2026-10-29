@@ -66,7 +66,10 @@ WECHAT_SCREEN_DPI=100
 WECHAT_LOCALE=C.UTF-8
 TZ=UTC
 ENABLE_VNC=1
+WECHAT_NATIVE_MEDIA_DOWNLOAD=false
 ```
+
+The Compose file passes `WECHAT_NATIVE_MEDIA_DOWNLOAD` from `deployment.env` into the container; no override file is needed. The example disables native downloads while retaining local cache reads. Set `true` to enable native downloads. If omitted or empty, Compose uses `true` for backward compatibility. Host environment variables take precedence over values in `--env-file`, so inspect the rendered configuration below. This setting requires an image with the media switch, such as release `2026.10.22` or later.
 
 Replace the example with a locally verified image ID or immutable digest; Compose does not pull images automatically. Data volumes must be existing external volumes. Use the existing token file: do not regenerate it when taking over existing data, or current client credentials will stop working. A missing token path is not automatically created as a directory. For a new, independent deployment only, prepare volumes and a token as described below. The configuration fixes host networking, API listener `[::]:6174`, existing capabilities/seccomp settings, 64 MiB shared memory, and screen/locale/TZ/VNC settings.
 
@@ -77,11 +80,9 @@ docker compose --env-file /path/to/deployment.env config
 
 Taking over an existing container involves stopping the service and recreating the container, so do this during a maintenance window. Confirm the existing volume names, token, hostname, software version, and metadata; do not mistake a newly created project with the same name for an in-place update. Keep VNC in `-viewonly` mode. Port 5900 listens only on `127.0.0.1` and `::1`, and websockify on 6080 listens only on loopback; access it through the authenticated API proxy.
 
-### Pinning the WeChat client version
+### Fixed WeChat package builds
 
-Full source image builds currently prefer `docker/wechat.deb`; if it is absent, the build can still download from an upstream mutable URL, which does not guarantee the same WeChat version on rebuild. To reinstall a pinned version, retain the verified original package and its checksum. An image tag alone does not identify the WeChat version.
-
-If the original package is no longer available, a configuration-update image can be derived from an **already verified and precisely pinned runtime image**, retaining its WeChat and system dependencies while replacing only the accepted server/startup scripts. This reuses an existing installation; it does not prove a complete rebuild from the original deb. Check ABI compatibility and actual startup in the same target runtime image. Do not include account data, temporary investigation files, or incompatible host-built binaries.
+Source image builds require the verified WeChat 4.1.13.23 AMD64 package. `docker/verify-wechat-package.sh` pins SHA-256 `b7d0f8d53e9f648bc2c77a6096a04100d008f2d9f0d3988a2a4859b5992aca0a` and validates package metadata. Set `WECHAT_DEB_PATH` to an explicit local `.deb`; `bash scripts/download-wechat.sh` validates it and stages it as `docker/wechat.deb`. In CI, `WECHAT_DEB_AMD64_URL` may specify an archive location; the URL is not a trust check, and the downloaded package must pass the same verification. Missing or invalid packages and unsupported architectures fail; the build does not download the latest package as a fallback. No verified 4.1.13.23 ARM64 archive is currently available, so ARM64 source builds fail. The published `2026.10.22` dual-architecture image remains available, but it is not this fixed-package build; smoke checks do not validate login/account data, and the tested AMD64 image's older helper produced `keys_unavailable`. A fixed-package build is still a candidate, not a new published release.
 
 ## File paths (inside the container)
 

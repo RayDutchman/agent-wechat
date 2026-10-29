@@ -2,6 +2,7 @@ import os
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,7 +19,8 @@ class HostComposeTest(unittest.TestCase):
     def test_compose_is_host_networked_and_keeps_required_settings(self):
         env = os.environ.copy()
         for name in ("WECHAT_SCREEN_WIDTH", "WECHAT_SCREEN_HEIGHT", "WECHAT_SCREEN_DEPTH",
-                     "WECHAT_SCREEN_DPI", "WECHAT_LOCALE", "TZ", "ENABLE_VNC"):
+                     "WECHAT_SCREEN_DPI", "WECHAT_LOCALE", "TZ", "ENABLE_VNC",
+                     "WECHAT_NATIVE_MEDIA_DOWNLOAD"):
             env.pop(name, None)
         env.update({
             "AGENT_WECHAT_IMAGE": "sha256:" + "a" * 64,
@@ -66,6 +68,29 @@ class HostComposeTest(unittest.TestCase):
         self.assertTrue(config["volumes"]["agent-wechat-home"]["external"])
         self.assertEqual(config["volumes"]["agent-wechat-data"]["name"], "test-agent-data")
         self.assertEqual(config["volumes"]["agent-wechat-home"]["name"], "test-agent-home")
+
+    def test_native_media_setting_from_deployment_env(self):
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AGENT_WECHAT_", "COMPOSE_"))
+               and key != "WECHAT_NATIVE_MEDIA_DOWNLOAD"}
+        temp_root = ROOT / "tmp"
+        temp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            settings = Path(directory) / "deployment.env"
+            for value, expected in (("false", "false"), ("true", "true"), (None, "true")):
+                with self.subTest(value=value):
+                    settings.write_text(
+                        "AGENT_WECHAT_IMAGE=sha256:" + "a" * 64 + "\n"
+                        + f"AGENT_WECHAT_TOKEN_FILE={directory}/unused-token\n"
+                        + (f"WECHAT_NATIVE_MEDIA_DOWNLOAD={value}\n" if value is not None else "")
+                    )
+                    result = subprocess.run(
+                        ["docker", "compose", "--env-file", str(settings),
+                         "-f", "docker-compose.yml", "config", "--format", "json"],
+                        cwd=ROOT, env=env, check=True, capture_output=True, text=True,
+                    )
+                    actual = json.loads(result.stdout)["services"]["agent-wechat"]["environment"]
+                    self.assertEqual(actual.get("WECHAT_NATIVE_MEDIA_DOWNLOAD"), expected)
 
 
 if __name__ == "__main__":
