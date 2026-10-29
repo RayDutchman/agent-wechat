@@ -15,8 +15,7 @@ case "$ARCH" in
     EXPECTED_SHA256=b7d0f8d53e9f648bc2c77a6096a04100d008f2d9f0d3988a2a4859b5992aca0a
     ;;
   arm64)
-    echo "Unsupported WeChat architecture: arm64 package has not been verified" >&2
-    exit 1
+    EXPECTED_SHA256=51784a262c725ef1595dd833f456190e913583dd81c24dd8fe587532bc91c0dc
     ;;
   *)
     echo "Unsupported WeChat architecture: ${ARCH:-<missing>}" >&2
